@@ -277,3 +277,35 @@ class EncoderLayer(LightweightModule):
         h = h * self.ls2
         x = residual + h
         return x
+
+
+class Model(LightweightModule):
+    """Full DINOv2 encoder: Embeddings -> 24x EncoderLayer -> final LayerNorm. Matches
+    reference `Dinov2Model.forward` exactly (the reference's `pooled_output` is just
+    `sequence_output[:, 0, :]`, the CLS token -- no separate pooler weights to port)."""
+
+    def __init__(self, embeddings: Embeddings, layers: list, final_norm, cfg: Dinov2Config):
+        self.embeddings = embeddings
+        self.layers = layers
+        self.final_norm_w, self.final_norm_b = final_norm
+        self.cfg = cfg
+
+    @classmethod
+    def from_state_dict(cls, state_dict, *, cfg: Dinov2Config, device):
+        embeddings = Embeddings.from_state_dict(state_dict, cfg=cfg, device=device)
+        layers = [
+            EncoderLayer.from_state_dict(state_dict, layer_idx=i, cfg=cfg, device=device)
+            for i in range(cfg.num_layers)
+        ]
+        final_norm = _torch_norm_to_ttnn(state_dict["layernorm.weight"], state_dict["layernorm.bias"], device)
+        return cls(embeddings, layers, final_norm, cfg)
+
+    def forward(self, pixel_values: torch.Tensor) -> "ttnn.Tensor":
+        seq_len = self.cfg.grid_size * self.cfg.grid_size + 1
+        x = self.embeddings(pixel_values)
+        for layer in self.layers:
+            x = layer(x, batch=pixel_values.shape[0], seq_len=seq_len)
+        return ttnn.layer_norm(
+            x, weight=self.final_norm_w, bias=self.final_norm_b, epsilon=self.cfg.layer_norm_eps,
+            compute_kernel_config=_hifi_compute_kernel_config(),
+        )
