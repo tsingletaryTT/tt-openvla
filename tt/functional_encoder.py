@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""TTNN functional bring-up of DINOv2 ViT-L/14 (facebook/dinov2-large), one of the two
-vision towers OpenVLA fuses (the other is SigLIP ViT-So400M/14, not yet ported).
+"""TTNN functional bring-up of DINOv2 ViT-L/14, one of the two vision towers OpenVLA
+fuses (the other is SigLIP ViT-So400M/14, functional_siglip.py).
 
 Bidirectional ViT encoder, standard (non-RoPE) multi-head self-attention -- simpler
 than tt-vjepa2's V-JEPA2 encoder in that one specific respect, but with one
@@ -8,19 +8,41 @@ architectural piece V-JEPA2 doesn't have: LayerScale, a learned per-channel scal
 applied to each sub-block's output before the residual add.
 
 OpenVLA runs this encoder at 224px, not DINOv2's own 518px default config -- the
-pretrained position embeddings (37x37 patches + 1 CLS token) need bicubic
-interpolation down to 16x16+1 for a 224px/14px-patch input. That interpolation is a
-static, one-time operation on the position-embedding *weights*, not something that
-needs to run per-inference on activations -- so it happens on the host in plain
-PyTorch (see `interpolate_position_embeddings`), the same way tt-vjepa2 precomputes
-RoPE tables on the host rather than building a rotary-embedding kernel that recomputes
-them per call.
+pretrained position embeddings (37x37 patches, +1 CLS token in the plain checkpoint)
+need bicubic interpolation down to 16x16 for a 224px/14px-patch input. That
+interpolation is a static, one-time operation on the position-embedding *weights*, not
+something that needs to run per-inference on activations -- so it happens on the host
+in plain PyTorch (see `interpolate_position_embeddings`), the same way tt-vjepa2
+precomputes RoPE tables on the host rather than building a rotary-embedding kernel that
+recomputes them per call.
 
-Reference: transformers.models.dinov2.modeling_dinov2 (Dinov2Embeddings,
-Dinov2PatchEmbeddings, Dinov2Layer, Dinov2SelfAttention, Dinov2LayerScale, Dinov2MLP).
-Checkpoint: facebook/dinov2-large via `transformers.Dinov2Model.from_pretrained`, HF
-key naming (`embeddings.*`, `encoder.layer.N.*`) -- not Meta's original DINOv2 repo's
-own key names.
+OpenVLA's ACTUAL tower is not the plain checkpoint: `configuration_prismatic.py`'s
+`dinosiglip-vit-so-224px` maps to timm id `vit_large_patch14_reg4_dinov2.lvd142m` --
+the "with registers" variant (4 extra learnable tokens, "Vision Transformers Need
+Registers"), loaded via `timm.create_model(...)`, not `transformers.Dinov2Model`. This
+config's `num_register_tokens`/`no_embed_class` fields (default 0/False, matching the
+plain checkpoint validated first) support both. Confirmed the two are NOT
+interchangeable even at the reference level: HF's own port at
+`facebook/dinov2-with-registers-large` gives the CLS token a nonzero learned position
+embedding, while timm's `no_embed_class=True` scheme (the one this checkpoint actually
+uses -- see `Embeddings`' docstring) adds position embeddings to patches only, before
+CLS/register tokens are ever concatenated in -- so the two checkpoints, despite
+identical parameter values for cls_token/patch_embed/register_tokens (PCC 1.0, checked
+directly), do NOT compute the same forward function. This port targets timm's actual
+checkpoint and forward semantics as ground truth, not HF's reimplementation -- see
+`_timm_vit_reg_state_dict_to_hf_style`.
+
+Reference (plain checkpoint, num_register_tokens=0): transformers.models.dinov2
+.modeling_dinov2 (Dinov2Embeddings, Dinov2PatchEmbeddings, Dinov2Layer,
+Dinov2SelfAttention, Dinov2LayerScale, Dinov2MLP). Checkpoint: facebook/dinov2-large
+via `transformers.Dinov2Model.from_pretrained`, HF key naming (`embeddings.*`,
+`encoder.layer.N.*`).
+Reference (register variant, OpenVLA's actual tower): timm.models.vision_transformer
+.VisionTransformer, `vit_large_patch14_reg4_dinov2.lvd142m` via
+`timm.create_model(..., pretrained=True)`, timm's own flat key naming
+(`blocks.N.*`, fused `attn.qkv`) -- translated to this module's HF-style keys by
+`_timm_vit_reg_state_dict_to_hf_style` so `EncoderLayer`/`SelfAttention`/`Model` stay
+checkpoint-agnostic.
 """
 
 from __future__ import annotations
@@ -57,6 +79,8 @@ class Dinov2Config:
     layer_norm_eps: float = 1e-6
     image_size: int = 224  # OpenVLA's actual input size, not the checkpoint's own 518 default
     pretrained_image_size: int = 518  # what embeddings.position_embeddings was trained at
+    num_register_tokens: int = 0  # 4 for OpenVLA's actual tower (vit_large_patch14_reg4_dinov2) -- see functional_encoder.py's module docstring
+    no_embed_class: bool = False  # True for the register variant -- see Embeddings' docstring
 
     @property
     def head_dim(self) -> int:
@@ -65,6 +89,10 @@ class Dinov2Config:
     @property
     def grid_size(self) -> int:
         return self.image_size // self.patch_size
+
+    @property
+    def num_prefix_tokens(self) -> int:
+        return 1 + self.num_register_tokens  # CLS + registers
 
 
 def _torch_linear_to_ttnn(weight: torch.Tensor, bias: torch.Tensor, device, dtype=ttnn.float32):
@@ -82,17 +110,36 @@ def _torch_norm_to_ttnn(weight: torch.Tensor, bias: torch.Tensor, device, dtype=
 
 def interpolate_position_embeddings(position_embeddings: torch.Tensor, cfg: Dinov2Config) -> torch.Tensor:
     """Host-side, one-time: bicubic-resizes the pretrained (518px-grid) position
-    embeddings down to the actual (224px-grid) input this runs at. Matches reference
-    `Dinov2Embeddings.interpolate_pos_encoding` exactly (same bicubic mode,
-    align_corners=False, fp32 interpolation) -- verified by this module's own
-    correctness test comparing the *encoder's* output, which would fail immediately if
-    this diverged from the reference's own interpolation."""
-    class_pos_embed = position_embeddings[:, :1]
-    patch_pos_embed = position_embeddings[:, 1:]
-    dim = position_embeddings.shape[-1]
+    embeddings down to the actual (224px-grid) input this runs at.
 
+    Two layouts, matching the two reference implementations this module targets:
+      - `no_embed_class=False` (plain checkpoint): position_embeddings holds a CLS row
+        plus patch rows; split, interpolate patches only, re-attach the CLS row.
+        Matches reference `Dinov2Embeddings.interpolate_pos_encoding` exactly (same
+        bicubic mode, align_corners=False, fp32 interpolation).
+      - `no_embed_class=True` (register variant): timm's `no_embed_class` scheme means
+        position_embeddings holds ONLY patch rows to begin with (no CLS/register
+        slots at all -- see `Embeddings`' docstring), so the whole tensor is
+        interpolated as patches, no split needed.
+
+    Both verified by this module's own correctness tests comparing the *encoder's*
+    output end to end, which would fail immediately if this diverged from either
+    reference's own interpolation."""
+    dim = position_embeddings.shape[-1]
     old_grid = cfg.pretrained_image_size // cfg.patch_size
     new_grid = cfg.grid_size
+
+    if cfg.no_embed_class:
+        if old_grid == new_grid:
+            return position_embeddings
+        patch_pos_embed = position_embeddings.reshape(1, old_grid, old_grid, dim).permute(0, 3, 1, 2)
+        patch_pos_embed = F.interpolate(
+            patch_pos_embed.to(torch.float32), size=(new_grid, new_grid), mode="bicubic", align_corners=False
+        )
+        return patch_pos_embed.permute(0, 2, 3, 1).reshape(1, new_grid * new_grid, dim)
+
+    class_pos_embed = position_embeddings[:, :1]
+    patch_pos_embed = position_embeddings[:, 1:]
     if old_grid == new_grid:
         return position_embeddings
 
@@ -144,13 +191,29 @@ class PatchEmbed(LightweightModule):
 
 
 class Embeddings(LightweightModule):
-    """PatchEmbed -> prepend CLS token -> add (host-interpolated) position embeddings.
-    Matches reference `Dinov2Embeddings.forward` (dropout is a no-op in eval mode, so
-    omitted)."""
+    """PatchEmbed -> combine with CLS (and, for the register variant, register) tokens
+    and position embeddings. Two orderings, matching the two checkpoints this module
+    targets (see module docstring):
 
-    def __init__(self, patch_embed: PatchEmbed, cls_token: torch.Tensor, pos_embed: torch.Tensor, device):
+      - `no_embed_class=False` (plain checkpoint): prepend CLS to patches, THEN add
+        position embeddings (which include a CLS row) to the combined sequence.
+        Matches reference `Dinov2Embeddings.forward`.
+      - `no_embed_class=True` (register variant, OpenVLA's actual tower): add position
+        embeddings to patches FIRST (position_embeddings has no CLS/register rows at
+        all), THEN prepend [CLS, register_0..3] -- which therefore carry NO positional
+        information whatsoever, by construction. This is timm's `no_embed_class`
+        scheme (`VisionTransformer._pos_embed`), and it is NOT equivalent to
+        HF's `Dinov2WithRegistersEmbeddings.forward` (which gives CLS a learned
+        position and adds registers post-hoc) -- see module docstring for the PCC
+        check that confirmed these diverge despite sharing parameter values.
+
+    (Dropout is a no-op in eval mode, so omitted either way.)"""
+
+    def __init__(self, patch_embed: PatchEmbed, cls_token: torch.Tensor, pos_embed: torch.Tensor, device, *, register_tokens: torch.Tensor | None = None, no_embed_class: bool = False):
         self.patch_embed = patch_embed
         self.cls_token = cls_token  # (1,1,hidden), plain torch -- concatenated host-side
+        self.register_tokens = register_tokens  # (1,num_register_tokens,hidden) or None
+        self.no_embed_class = no_embed_class
         self.pos_embed_tt = ttnn.from_torch(pos_embed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
         self.device = device
 
@@ -158,15 +221,25 @@ class Embeddings(LightweightModule):
     def from_state_dict(cls, state_dict, *, cfg: Dinov2Config, device):
         patch_embed = PatchEmbed.from_state_dict(state_dict, cfg=cfg, device=device)
         cls_token = state_dict["embeddings.cls_token"]  # (1,1,hidden)
+        register_tokens = state_dict.get("embeddings.register_tokens") if cfg.num_register_tokens > 0 else None
         pos_embed = interpolate_position_embeddings(state_dict["embeddings.position_embeddings"], cfg)
-        return cls(patch_embed, cls_token, pos_embed, device)
+        return cls(patch_embed, cls_token, pos_embed, device, register_tokens=register_tokens, no_embed_class=cfg.no_embed_class)
+
+    def _prefix_tokens_tt(self, batch: int) -> list:
+        toks = [self.cls_token.expand(batch, -1, -1)]
+        if self.register_tokens is not None:
+            toks.append(self.register_tokens.expand(batch, -1, -1))
+        return [ttnn.from_torch(t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device) for t in toks]
 
     def forward(self, pixel_values: torch.Tensor) -> "ttnn.Tensor":
         B = pixel_values.shape[0]
         embeddings = self.patch_embed(pixel_values)  # (B, num_patches, hidden)
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B,1,hidden)
-        cls_tt = ttnn.from_torch(cls_tokens, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
-        embeddings = ttnn.concat([cls_tt, embeddings], dim=1)
+
+        if self.no_embed_class:
+            embeddings = embeddings + self.pos_embed_tt
+            return ttnn.concat(self._prefix_tokens_tt(B) + [embeddings], dim=1)
+
+        embeddings = ttnn.concat(self._prefix_tokens_tt(B) + [embeddings], dim=1)
         return embeddings + self.pos_embed_tt
 
 
@@ -301,7 +374,7 @@ class Model(LightweightModule):
         return cls(embeddings, layers, final_norm, cfg)
 
     def forward(self, pixel_values: torch.Tensor) -> "ttnn.Tensor":
-        seq_len = self.cfg.grid_size * self.cfg.grid_size + 1
+        seq_len = self.cfg.grid_size * self.cfg.grid_size + self.cfg.num_prefix_tokens
         x = self.embeddings(pixel_values)
         for layer in self.layers:
             x = layer(x, batch=pixel_values.shape[0], seq_len=seq_len)
@@ -309,3 +382,51 @@ class Model(LightweightModule):
             x, weight=self.final_norm_w, bias=self.final_norm_b, epsilon=self.cfg.layer_norm_eps,
             compute_kernel_config=_hifi_compute_kernel_config(),
         )
+
+
+def timm_vit_reg_state_dict_to_hf_style(state_dict: dict, *, num_layers: int) -> dict:
+    """Rename a timm `VisionTransformer` state dict (flat `blocks.N.*`, fused
+    `attn.qkv`) into this module's HF-style keys (`embeddings.*`, `encoder.layer.N.*`,
+    separate query/key/value), so `Embeddings`/`SelfAttention`/`EncoderLayer`/`Model`
+    stay checkpoint-agnostic and don't need a parallel timm-flavored implementation.
+
+    The qkv split-then-immediately-reconcatenated-by-SelfAttention roundtrip is
+    wasteful but exactly correct and zero-risk against already-validated code --
+    optimizing it away is a ttm-optimize question for later, not a correctness one."""
+    out = {}
+    out["embeddings.cls_token"] = state_dict["cls_token"]
+    if "reg_token" in state_dict:
+        out["embeddings.register_tokens"] = state_dict["reg_token"]
+    out["embeddings.position_embeddings"] = state_dict["pos_embed"]
+    out["embeddings.patch_embeddings.projection.weight"] = state_dict["patch_embed.proj.weight"]
+    out["embeddings.patch_embeddings.projection.bias"] = state_dict["patch_embed.proj.bias"]
+
+    for i in range(num_layers):
+        src, dst = f"blocks.{i}", f"encoder.layer.{i}"
+        out[f"{dst}.norm1.weight"] = state_dict[f"{src}.norm1.weight"]
+        out[f"{dst}.norm1.bias"] = state_dict[f"{src}.norm1.bias"]
+        qkv_w = state_dict[f"{src}.attn.qkv.weight"]  # (3*hidden, hidden), fused in q,k,v order
+        qkv_b = state_dict[f"{src}.attn.qkv.bias"]
+        hidden = qkv_w.shape[1]
+        q_w, k_w, v_w = qkv_w.split(hidden, dim=0)
+        q_b, k_b, v_b = qkv_b.split(hidden, dim=0)
+        out[f"{dst}.attention.attention.query.weight"] = q_w
+        out[f"{dst}.attention.attention.key.weight"] = k_w
+        out[f"{dst}.attention.attention.value.weight"] = v_w
+        out[f"{dst}.attention.attention.query.bias"] = q_b
+        out[f"{dst}.attention.attention.key.bias"] = k_b
+        out[f"{dst}.attention.attention.value.bias"] = v_b
+        out[f"{dst}.attention.output.dense.weight"] = state_dict[f"{src}.attn.proj.weight"]
+        out[f"{dst}.attention.output.dense.bias"] = state_dict[f"{src}.attn.proj.bias"]
+        out[f"{dst}.layer_scale1.lambda1"] = state_dict[f"{src}.ls1.gamma"]
+        out[f"{dst}.layer_scale2.lambda1"] = state_dict[f"{src}.ls2.gamma"]
+        out[f"{dst}.norm2.weight"] = state_dict[f"{src}.norm2.weight"]
+        out[f"{dst}.norm2.bias"] = state_dict[f"{src}.norm2.bias"]
+        out[f"{dst}.mlp.fc1.weight"] = state_dict[f"{src}.mlp.fc1.weight"]
+        out[f"{dst}.mlp.fc1.bias"] = state_dict[f"{src}.mlp.fc1.bias"]
+        out[f"{dst}.mlp.fc2.weight"] = state_dict[f"{src}.mlp.fc2.weight"]
+        out[f"{dst}.mlp.fc2.bias"] = state_dict[f"{src}.mlp.fc2.bias"]
+
+    out["layernorm.weight"] = state_dict["norm.weight"]
+    out["layernorm.bias"] = state_dict["norm.bias"]
+    return out
