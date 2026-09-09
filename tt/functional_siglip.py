@@ -20,6 +20,22 @@ Reference: transformers.models.siglip.modeling_siglip (SiglipVisionEmbeddings,
 SiglipEncoderLayer, SiglipAttention, SiglipMLP, SiglipMultiheadAttentionPoolingHead).
 Checkpoint: google/siglip-so400m-patch14-224 via
 `transformers.SiglipVisionModel.from_pretrained`.
+
+OpenVLA's own `configuration_prismatic.py` loads this tower via the BARE timm id
+`vit_so400m_patch14_siglip_224` (no tag suffix) through `timm.create_model(...,
+pretrained=True)` -- unlike its DINOv2 tower (see functional_encoder.py's module
+docstring), this checkpoint choice checked out correct on inspection, but only after a
+real scare worth recording: timm's registry now has TWO tagged variants,
+`.webli` (SigLIP v1, what OpenVLA was actually trained/released against in 2024) and
+`.v2_webli` (SigLIP2, added to timm well after OpenVLA's release) -- and the bare,
+untagged name currently resolves to `.v2_webli`, NOT `.webli`. Running OpenVLA's own
+code as literally written, today, on a current timm install would silently load the
+wrong (SigLIP2) checkpoint. Checked directly: `vit_so400m_patch14_siglip_224.webli`'s
+weights are bit-identical (PCC 1.0 on patch_embed/pos_embed/final-norm) to this port's
+actual reference checkpoint above, so this port targets the *correct*, original
+checkpoint despite the trap -- but the trap itself (a bare model name whose resolved
+weights silently changed underneath it) is the kind of thing that would have produced
+a confidently-wrong "reproduction" if not checked against the pinned tag explicitly.
 """
 
 from __future__ import annotations

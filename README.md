@@ -32,12 +32,25 @@ things (this repo's code vs. Meta's weights) and it would be easy to conflate th
 
 ## Architecture (confirmed so far)
 
-- **Vision**: DINOv2 ViT-L/14 (`facebook/dinov2-large`: 24 blocks, 1024 hidden, 16
-  heads, patch 14, LayerScale after each sub-block) + SigLIP ViT-So400M/14, both at
-  224px (not DINOv2's own 518px default -- position embeddings need interpolating).
-  Exact fusion mechanism between the two towers is not yet confirmed from documentation
-  alone; this gets nailed down by reading `transformers`' actual OpenVLA/Prismatic
-  model source once the individual encoders are validated.
+- **Vision**: DINOv2 ViT-L/14, register-token variant (`vit_large_patch14_reg4_dinov2
+  .lvd142m` via timm -- NOT the plain `facebook/dinov2-large` this repo validated
+  first; corrected after reading OpenVLA's own `configuration_prismatic.py`, which
+  names the real timm checkpoint id) + SigLIP ViT-So400M/14 (`vit_so400m_patch14
+  _siglip_224.webli` via timm, bit-identical to `google/siglip-so400m-patch14-224` --
+  checked directly after finding the *bare*, untagged timm name now silently resolves
+  to a SigLIP2 checkpoint that didn't exist when OpenVLA was released). Both run at
+  224px (not DINOv2's own 518px default -- position embeddings need interpolating,
+  handled host-side).
+  **Fusion mechanism, confirmed from `modeling_prismatic.py`'s
+  `PrismaticVisionBackbone`**: the 224x224x3 input image is preprocessed twice (once
+  per tower's own normalization) and stacked into a 6-channel tensor; each tower runs
+  through all but its *last* transformer block (`timm`'s
+  `get_intermediate_layers(n={num_blocks-2})` -- no final norm, and CLS/register
+  tokens are dropped, leaving only the 256 per-patch tokens); the two towers' patch
+  tokens are concatenated along the feature dim (1024+1152=2176), then projected
+  through a 3-layer GELU MLP (2176 -> 4x -> llm_dim -> llm_dim) into LLaMA's embedding
+  space. Not yet ported; the two encoders are validated up to their own final layers
+  first (see `tt/`).
 - **Backbone**: LLaMA-2-7B (Llama Community License).
 - **Reference implementation**: real and strong -- `openvla/openvla-7b` is integrated
   into the standard `transformers` library (`AutoModelForVision2Seq`), giving a
