@@ -23,11 +23,12 @@ from pathlib import Path
 
 import gradio as gr
 import numpy as np
+import pandas as pd
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
 EXAMPLE_IMAGE_PATH = REPO_ROOT / "gradio_app" / "assets" / "example.jpg"
 EXAMPLE_PROMPT = "What action should the robot take to open the drawer?"
 
@@ -86,7 +87,14 @@ to demonstrate a semantically correct drawer-opening prediction."""
                 raise gr.Error("Enter an instruction.")
             full_prompt = f"In: What action should the robot take to {prompt.strip().rstrip('?')}?\nOut:"
             result = backend.predict_action(image, full_prompt, unnorm_key=unnorm_key)
-            action_data = {"dimension": ACTION_LABELS, "value": [float(v) for v in result["action"]]}
+            # gr.BarPlot.postprocess only converts a DataFrame into renderable chart data --
+            # a plain dict is passed straight through unprocessed (its `isinstance(value, dict)`
+            # branch exists for gr.update() payloads, not arbitrary data), leaving the frontend
+            # to choke on an unexpected shape with no error surfaced, just a hung UI.
+            action_data = pd.DataFrame({
+                "dimension": ACTION_LABELS,
+                "value": [float(v) for v in result["action"]],
+            })
             tokens_str = ", ".join(str(t) for t in result["tokens"])
             latency_str = f"{result['latency_ms']:.1f} ms ({backend.name})"
             return action_data, tokens_str, latency_str
