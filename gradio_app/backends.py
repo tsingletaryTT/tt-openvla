@@ -232,7 +232,13 @@ class TTNNBackend:
         self.llama_sd = load_openvla_llama_state_dict()
 
         print("[ttnn] setting fabric config...")
-        ttnn.set_fabric_config(True)
+        # NOT a bare `True` -- models/tt_transformers/conftest.py's own device_params
+        # fixture treats `True` as a placeholder it translates to this exact enum
+        # value before it ever reaches ttnn.set_fabric_config() for a non-galaxy mesh
+        # (see its `elif params["fabric_config"] == True:` branch). Passing `True`
+        # straight to the real API lets Python coerce it to whatever FabricConfig enum
+        # value happens to sit at the underlying int, not necessarily FABRIC_1D.
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
 
         print("[ttnn] opening 1x2 mesh device...")
         open_kwargs = {}
