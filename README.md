@@ -17,9 +17,13 @@ bring-ups in the world-model/robotics-manipulation space), not code-sharing.
 
 ## Status
 
-Early bring-up. Currently validating feasibility component-by-component before
-attempting the full model -- see `tt/` for what's been ported and correctness-tested
-so far.
+Core pipeline validated end to end, component by component, each against real
+checkpoint weights at >=0.995 PCC: DINOv2 (register variant) -> SigLIP -> fused
+VisionBackbone -> Projector -> full 32-layer LLaMA-2-7B backbone. See `tt/` for the
+individual modules and their correctness tests. Remaining work is downstream of this:
+feeding real vision tokens (not just text) into the LLM in one forward pass, and
+action-token detokenization -- see **Architecture** below for what's confirmed and
+what's still to come.
 
 ## License
 
@@ -49,9 +53,24 @@ things (this repo's code vs. Meta's weights) and it would be easy to conflate th
   tokens are dropped, leaving only the 256 per-patch tokens); the two towers' patch
   tokens are concatenated along the feature dim (1024+1152=2176), then projected
   through a 3-layer GELU MLP (2176 -> 4x -> llm_dim -> llm_dim) into LLaMA's embedding
-  space. Not yet ported; the two encoders are validated up to their own final layers
-  first (see `tt/`).
-- **Backbone**: LLaMA-2-7B (Llama Community License).
+  space. All of the above is ported and validated (PCC 0.996-0.999) against real
+  weights, including the Projector's own weights, which only exist in the
+  `openvla/openvla-7b` checkpoint itself (a downstream fine-tuned artifact, not
+  derivable from either frozen vision tower's own pretrained weights).
+- **Backbone**: LLaMA-2-7B (Llama Community License), all 32 layers, real fine-tuned
+  `openvla-7b` weights, validated end to end (PCC 0.9966 on final logits against a real
+  `transformers.LlamaForCausalLM`). Built by reusing tt-metal's own
+  `models/tt_transformers` `Transformer`/`ModelArgs` directly (its attention/RoPE/
+  KV-cache kernels and tuned program configs, not hand-ported) rather than the
+  separate, unfinished `models/experimental/openvla` attempt already in tt-metal
+  (its own README documents "Full Model PCC: TBD" and an unresolved layer 0-2
+  divergence bug, root-caused by inspection to passing `mode="prefill"` as a bare
+  string where the framework compares against the `Mode.PREFILL` enum -- avoided here
+  by always passing the actual enum). Deliberately targets `openvla-7b`'s own weights
+  directly rather than the separate, gated `meta-llama/Llama-2-7b-hf` checkpoint: the
+  fine-tuned weights already live in `openvla-7b`'s own (ungated) checkpoint, and the
+  base architecture's config values are public, undisputed constants, not gated
+  content -- only Meta's own weights are gated, which this port never touches.
 - **Reference implementation**: real and strong -- `openvla/openvla-7b` is integrated
   into the standard `transformers` library (`AutoModelForVision2Seq`), giving a
   canonical implementation to validate correctness against at every stage, the same
