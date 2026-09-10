@@ -129,7 +129,7 @@ def main():
 
     demo = build_app(backend, unnorm_keys)
     try:
-        demo.launch(share=args.share)
+        demo.launch(server_name="0.0.0.0", share=args.share)
     finally:
         if hasattr(backend, "close"):
             backend.close()

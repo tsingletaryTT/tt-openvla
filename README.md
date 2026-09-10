@@ -42,6 +42,73 @@ library bug hit and root-caused along the way (non-deterministic NaN logits from
 default "eager" attention implementation at this real sequence length -- fixed by
 requesting `sdpa`).
 
+## Interactive demo
+
+`gradio_app/app.py` is a real Gradio UI: upload (or use the bundled example) image,
+write an instruction, click "Predict action," and get back an actual decoded 7-DoF
+action from a real forward pass -- the same pipeline `tt/demo_grounded_check.py`
+validates, wrapped for repeated interactive use (weights load once at startup, not per
+click). Two backends, same interface (`gradio_app/backends.py`, mirroring
+[tt-vjepa2](https://github.com/tsingletaryTT/tt-vjepa2)'s own
+`gradio_app/backends.py` pattern):
+
+```bash
+# Real Blackhole hardware (default) -- hold a gozer lease covering 2 chips first
+TT_METAL_HOME=/path/to/tt-metal .venv/bin/python3 gradio_app/app.py
+
+# CPU-only reference (what an HF Space without Tenstorrent hardware runs)
+.venv/bin/python3 gradio_app/app.py --backend reference
+```
+
+Two real hardware/library bugs were found and fixed getting this working end to end
+(both documented in `gradio_app/backends.py`'s own docstrings, worth reading before
+touching this code): a `timm`-then-`transformers` load-order interaction that silently
+poisons `LlamaForCausalLM`'s SDPA attention into NaN, and a fabric-handshake hang from
+opening a plain single device alongside an open 2-device mesh in the same process
+(fixed by running vision on the same mesh, replicated, instead of a separate device).
+
+**Catalog entry**: `.disco/app.yaml` registers this demo with
+[tt-discolike](https://github.com/tsingletaryTT/tt-discolike) (`chips: 2`, matching the
+LLaMA backbone's real tensor-parallel mesh requirement) for one-click start/stop
+alongside this machine's other TT gradio demos (tt-vjepa2, tt-animatediff).
+
+## Benchmarks
+
+Real end-to-end latency (`tt/benchmark.py` / `tt/cpu_benchmark.py`) for the full
+pipeline at the demo's real operating shape -- not traced replay (unlike
+tt-vjepa2's own benchmark): this pipeline's shapes change per call (padded prefill
+length depends on prompt length; decode position advances every step) in ways traced
+replay doesn't tolerate, so this is real device execution time including host
+dispatch -- an honest number for what the demo itself experiences, not a best-case
+device-only figure.
+
+| | latency/call | relative |
+|---|---|---|
+| Blackhole (TTNN, 2-chip mesh, kernel cache warm) | ~320 ms | 1x |
+| same, first-ever call (one-time kernel JIT compilation, cached to disk after) | ~9-11 s | ~30x slower, once |
+| CPU reference (composed real PyTorch, same host machine) | ~10.0 s | ~31x slower |
+
+The one-time compilation cost is exactly that -- once: it persists in tt-metal's own
+on-disk build cache across process restarts, not just within one, so a real user pays
+it once per machine, not once per demo session.
+
+## Publishing
+
+Two publishing surfaces beyond GitHub + the HF model card above:
+
+- **[tt-discolike](https://github.com/tsingletaryTT/tt-discolike)**: done, see
+  *Interactive demo* above.
+- **[tt-model-manager](https://github.com/tenstorrent/tt-model-manager)**
+  (`tt-model.yaml`, `kind: tt-dit-server`): authored and validates cleanly against the
+  tool's own schema checks, but actually building the container is blocked on this
+  machine's shared TT_METAL_HOME checkout having uninitialized git submodules (`git
+  submodule update --init --recursive` would fix it, not run here since that checkout
+  is shared with other concurrent work on this machine). tt-model-manager's own docs
+  mark the whole container path "Experimental -- no support, no guarantees," and this
+  would be the first non-diffusion model on the `tt-dit-server` kind (so far only
+  exercised by FLUX.2-dev/tt-animatediff/tt-skyreels) -- treat completing this as a
+  real, scoped, but not-yet-done next step, not a broken promise.
+
 ## License
 
 This repo's own code: MIT, matching [openvla/openvla](https://github.com/openvla/openvla)'s
