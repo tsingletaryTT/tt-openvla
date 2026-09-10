@@ -24,6 +24,7 @@ kind (read that docstring for the full rationale):
 import asyncio
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -78,9 +79,27 @@ _backend = _BackendHandle()
 _demo = build_app(_backend, _resolve_unnorm_keys())
 
 
+def _physical_device_ids_from_env() -> list[int] | None:
+    """Optional escape hatch for a shared/dev box: a dedicated production deployment
+    (this kind's actual target) has no reason to set this, since `--device
+    /dev/tenstorrent` there exposes only the chips that box actually has. On a shared
+    box with other leases active, restricting `--device` to just the leased nodes
+    instead breaks UMD's cluster/ethernet-topology discovery (confirmed: it hung
+    indefinitely past 'Failed to discover available ethernet links' with no forward
+    progress) -- discovery needs to see the whole board. This env var lets the launcher
+    keep full device visibility for discovery while still pinning the actual mesh open
+    to specific chip ids, so it can't collide with another lease-holder's chip."""
+    raw = os.environ.get("OPENVLA_PHYSICAL_DEVICE_IDS")
+    if not raw:
+        return None
+    return [int(x) for x in raw.split(",") if x.strip()]
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
-    real_backend = await asyncio.to_thread(TTNNBackend)
+    real_backend = await asyncio.to_thread(
+        TTNNBackend, mesh_physical_device_ids=_physical_device_ids_from_env()
+    )
     _backend.set(real_backend)
     try:
         yield
