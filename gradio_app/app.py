@@ -74,7 +74,7 @@ to demonstrate a semantically correct drawer-opening prediction."""
             with gr.Column():
                 action_plot = gr.BarPlot(
                     x="dimension", y="value", title="Decoded 7-DoF action",
-                    x_title="", y_title="normalized delta", vertical=False,
+                    x_title="", y_title="normalized delta",
                 )
                 tokens_out = gr.Textbox(label="Generated action-token ids", interactive=False)
                 latency_out = gr.Textbox(label="Latency", interactive=False)

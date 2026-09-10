@@ -60,9 +60,11 @@ runtime:
     - safetensors
     - huggingface_hub
     - datasets
-    - gradio==6.26.0   # matches this repo's own validated dev venv -- a newer gradio
-                       # dropped gr.BarPlot's `vertical` kwarg (unpinned pulled 6.x+ and
-                       # broke build_app())
+    # gradio 6.x requires huggingface-hub>=1.16, which is incompatible with
+    # tokenizers==0.21.4's own huggingface-hub<1.0 requirement (a genuine, unresolvable
+    # conflict, not a version-drift issue -- confirmed via uv's resolver). 5.40.0 is the
+    # newest 5.x release still on the <1.0 side of that split.
+    - gradio==5.40.0
     # Everything below is pulled in transitively by tt-metal's own
     # models/common + models/tt_transformers modules (loguru for its logger,
     # pytest because utility_functions.py imports it unconditionally, the rest
