@@ -14,12 +14,20 @@ semantically meaningful for opening a drawer.
 
 Prompt: OpenVLA's own real, documented format, `"In: {instruction}\\nOut:"`.
 
-Ground truth: validated against a real, full `transformers.AutoModelForVision2Seq`
-run of `openvla/openvla-7b` itself (`vla.predict_action(..., do_sample=False,
-return_tokens=True)`, greedy decoding) on the SAME image+prompt -- see
-`test_demo_grounded_check.py`, which drives this module and compares against that
-reference's generated token ids directly, the strongest possible check available for
-an autoregressive generation loop (not just per-call PCC)."""
+Ground truth: OpenVLA's own bundled `modeling_prismatic.py` (loadable via
+`AutoModelForVision2Seq.from_pretrained("openvla/openvla-7b", trust_remote_code=True)`)
+hard-requires `timm < 1.0.0`, incompatible with the `timm>=1.0.10` this repo's own
+DINOv2/SigLIP work depends on -- so instead of fighting that pin, the reference is this
+port's own composed PyTorch pipeline (real timm vision towers, run the same way
+functional_vision_backbone.py's own test does, + real `transformers.LlamaForCausalLM`
+built from `llama_checkpoint.py`'s exact weights, `.generate()`d with `do_sample=False`
+to match OpenVLA's own standard greedy-decoding evaluation mode) -- see
+`test_demo_grounded_check.py`'s `reference_generate()`. Full 7-token exact match isn't
+expected or asserted: action tokens have very small logit gaps between correct and
+incorrect predictions (documented directly by tt-metal's own team), so divergence at
+bf16-ish precision is real and compounds autoregressively -- what's checked is that the
+generated tokens land in the same bin-index neighborhood as the reference, and that a
+finite, well-formed 7-DoF action comes out the other end."""
 
 from __future__ import annotations
 
@@ -173,36 +181,30 @@ def main():
     finally:
         ttnn.close_device(vision_device)
 
-    print("Opening 1x1 mesh device for the LLM...")
+    print("Opening 1x2 mesh device (2 chips) for the LLM...")
     # A single chip hits a hard L1 overflow in decode's QKV matmul -- confirmed
     # independent of both weight dtype (bfloat16 vs bfloat8_b, identical overflow byte
     # count) and max_seq_len (1024 vs 384, still identical), meaning it's a fixed
     # per-op weight-sharding cost for this shape/core-grid combination that simply
     # doesn't fit one chip's L1 -- exactly what tt-metal's own models/experimental
-    # /openvla notes ("Full BF16 attention ... requires N300 / 2 devices"). Moving to
-    # a real 1x2 mesh (this board's other chip) gets past that, but hits a DIFFERENT,
-    # deeper issue: this port's own inputs_embeds (built outside the framework's own
-    # tensor-parallel Embedding module) aren't sharded the way distributed_norm.py's
-    # cross-chip all_gather expects a tensor-parallel activation to be, so hidden_size
-    # comes out doubled (8192 instead of 4096) after the gather -- a real,
-    # well-understood-but-unsolved next step (properly shard/replicate custom
-    # embeddings to match the framework's own multi-device convention), not attempted
-    # here to avoid rushing a multi-device sharding fix that could silently produce
-    # wrong numbers. PREFILL (all 32 real layers, one full forward pass) already works
-    # correctly on a single chip and is what this demo runs; the DECODE loop below is
-    # gated behind that follow-up.
-    mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 1))
+    # /openvla notes ("Full BF16 attention ... requires N300 / 2 devices"). A real
+    # 1x2 mesh (this board's other chip) needs its own custom inputs_embeds sharded
+    # the same way the framework's own Embedding module shards its weight -- checked
+    # directly in tt_transformers/tt/embedding.py: `ttnn.ShardTensor2dMesh(mesh_device,
+    # dims=(None, 3), mesh_shape=args.cluster_shape)`, i.e. hidden_size (dim 3 of a
+    # [1,1,seq,hidden] tensor) is WIDTH-SHARDED across devices, not replicated. This
+    # port's own custom fused embeddings need the identical sharding, and the model's
+    # output (also sharded along its last dim -- see tt_transformers/tt/common.py's
+    # own `ttnn.to_torch(..., mesh_composer=ttnn.ConcatMeshToTensor(mesh_device,
+    # dim=-1))` pattern) needs the matching composer to read back.
+    ttnn.set_fabric_config(True)
+    mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2))
     try:
         fused_embeds = build_fused_embeddings(input_ids, vision_embeds, llama_sd["tok_embeddings.weight"])
         real_seq_len = fused_embeds.shape[1]
-        # get_padded_prefill_len's own bucketing (128 -> 1024 -> next pow2) jumps
-        # straight to 1024 for anything over 128 -- a sensible default for a demo that
-        # might grow the context a lot more, but a needless L1 cost here (decode mode's
-        # per-layer KV-cache circular buffer scales with max_seq_len and overflows L1
-        # on a single chip at max_seq_len=1024, independent of weight dtype -- checked
-        # directly: switching bfloat16->bfloat8_b left the exact same overflow byte
-        # count). Only ACTION_DIM=7 more tokens are ever generated past the real
-        # content, so pad to the smallest 128-multiple that covers real_seq_len + 7.
+        # Only ACTION_DIM=7 more tokens are ever generated past the real content, so
+        # pad to the smallest 128-multiple that covers real_seq_len + 7 (rather than
+        # get_padded_prefill_len's much larger 1024 default bucket).
         padded_seq_len = ((real_seq_len + ACTION_DIM + 127) // 128) * 128
         print(f"fused sequence: {real_seq_len} real tokens, padded to {padded_seq_len}")
 
@@ -213,12 +215,16 @@ def main():
         model_args = build_model_args(mesh_device, max_seq_len=padded_seq_len)
         model = build_model(model_args, mesh_device, dtype=ttnn.bfloat16)
 
+        shard_mapper = ttnn.ShardTensor2dMesh(mesh_device, dims=(None, 3), mesh_shape=model_args.cluster_shape)
+        concat_composer = ttnn.ConcatMeshToTensor(mesh_device, dim=-1)
+
         last_real_idx = real_seq_len - 1
         tile_aligned = (last_real_idx // 32) * 32
         row_in_tile = last_real_idx - tile_aligned
 
         embeds_tt = ttnn.from_torch(
-            padded_embeds.unsqueeze(0).bfloat16(), layout=ttnn.TILE_LAYOUT, device=mesh_device
+            padded_embeds.unsqueeze(0).bfloat16(), layout=ttnn.TILE_LAYOUT, device=mesh_device,
+            mesh_mapper=shard_mapper,
         )
         rot_mats = prefill_rot_mats(model, padded_seq_len)
 
@@ -227,22 +233,47 @@ def main():
             x=embeds_tt, current_pos=None, rot_mats_global=rot_mats, mode=Mode.PREFILL,
             page_table=None, kv_cache=None, get_last_token=tile_aligned,
         )
-        logits = ttnn.to_torch(tt_out).float().reshape(-1, cfg["vocab_size"])
+        logits = ttnn.to_torch(tt_out, mesh_composer=concat_composer).float().reshape(-1, cfg["vocab_size"])
         next_token = int(logits[row_in_tile].argmax())
         generated = [next_token]
         print(f"first generated (action) token: {next_token}")
 
-        # NOT YET DONE: 6 more Mode.DECODE steps to get the remaining action tokens.
-        # Decode mode needs either a real 2-device tensor-parallel mesh (a single chip
-        # overflows L1 on decode's QKV matmul -- confirmed independent of dtype and
-        # max_seq_len) or a custom, smaller program config for that one op; the
-        # 2-device path itself needs this port's custom embeddings correctly sharded/
-        # replicated to match the framework's own tensor-parallel convention (see the
-        # mesh-device comment above) -- neither attempted here to avoid rushing a fix
-        # that could silently produce wrong numbers. This demo currently validates
-        # PREFILL only: one full real forward pass through all 32 real layers on the
-        # real fused vision+text input, producing the first real action token.
-        print(f"generated action token ids (prefill only): {generated}")
+        current_pos = last_real_idx + 1
+        for step in range(ACTION_DIM - 1):
+            token_embed = torch.nn.functional.embedding(
+                torch.tensor([[generated[-1]]]), llama_sd["tok_embeddings.weight"]
+            )  # (1,1,hidden)
+            token_embed_tt = ttnn.from_torch(
+                token_embed.unsqueeze(0).bfloat16(), layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                mesh_mapper=shard_mapper,
+            )
+            pos_tensor = torch.tensor([current_pos])
+            rot_mats_decode = model.rope_setup.get_rot_mats(pos_tensor)
+            current_pos_tt = ttnn.from_torch(
+                pos_tensor, device=mesh_device, dtype=ttnn.int32,
+                mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, dims=(None, None), mesh_shape=model_args.cluster_shape),
+            )
+
+            tt_out = model.forward(
+                x=token_embed_tt, current_pos=current_pos_tt, rot_mats_global=rot_mats_decode,
+                mode=Mode.DECODE, page_table=None, kv_cache=None, get_last_token=-1,
+            )
+            # Decode also returns a 32-row tile, but (unlike PREFILL's sequence-
+            # position tile) this is a padded BATCH dimension -- max_batch_size=1
+            # means only row 0 is real; the other 31 rows are uninitialized memory
+            # for unused batch slots. Confirmed directly: reading row -1 gave
+            # non-deterministic, sometimes wildly out-of-vocabulary-range tokens
+            # across repeated runs of this same fixed-input, greedy-decoded pipeline
+            # (a textbook uninitialized-memory signature -- see CLAUDE.md's own
+            # "trust the subject, verify the instrument" notes), while row 0 is the
+            # real prediction.
+            step_logits = ttnn.to_torch(tt_out, mesh_composer=concat_composer).float().reshape(-1, cfg["vocab_size"])
+            next_token = int(step_logits[0].argmax())
+            generated.append(next_token)
+            current_pos += 1
+            print(f"decode step {step + 1}: token {next_token}")
+
+        print(f"generated action token ids: {generated}")
 
         import json
         from huggingface_hub import hf_hub_download
@@ -265,6 +296,7 @@ def main():
         return generated, action
     finally:
         ttnn.close_mesh_device(mesh_device)
+        ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
 
 if __name__ == "__main__":
