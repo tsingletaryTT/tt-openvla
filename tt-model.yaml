@@ -60,7 +60,9 @@ runtime:
     - safetensors
     - huggingface_hub
     - datasets
-    - gradio
+    - gradio==6.26.0   # matches this repo's own validated dev venv -- a newer gradio
+                       # dropped gr.BarPlot's `vertical` kwarg (unpinned pulled 6.x+ and
+                       # broke build_app())
     # Everything below is pulled in transitively by tt-metal's own
     # models/common + models/tt_transformers modules (loguru for its logger,
     # pytest because utility_functions.py imports it unconditionally, the rest
