@@ -89,4 +89,9 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
-app = gr.mount_gradio_app(app, _demo, path="/")
+# path="/" (not "") makes Starlette's Mount 307-redirect "/" -> "//" -- reproduced in
+# isolation outside this container with a minimal gr.Blocks() + mount_gradio_app, so
+# it's a real gradio/Starlette root-mount quirk, not something specific to this app.
+# The client bundle then throws `Invalid URL` trying to parse a config value built
+# from the doubled path, and the UI never gets past "Loading...".
+app = gr.mount_gradio_app(app, _demo, path="")
