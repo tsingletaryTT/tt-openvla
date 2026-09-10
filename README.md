@@ -19,11 +19,20 @@ bring-ups in the world-model/robotics-manipulation space), not code-sharing.
 
 Core pipeline validated end to end, component by component, each against real
 checkpoint weights at >=0.995 PCC: DINOv2 (register variant) -> SigLIP -> fused
-VisionBackbone -> Projector -> full 32-layer LLaMA-2-7B backbone. See `tt/` for the
-individual modules and their correctness tests. Remaining work is downstream of this:
-feeding real vision tokens (not just text) into the LLM in one forward pass, and
-action-token detokenization -- see **Architecture** below for what's confirmed and
-what's still to come.
+VisionBackbone -> Projector -> full 32-layer LLaMA-2-7B backbone -> action
+detokenization. See `tt/` for the individual modules and their correctness tests.
+
+A real "Grounded Check" demo (`tt/demo_grounded_check.py`) runs a real image and
+OpenVLA's own documented prompt through the whole pipeline (vision -> fused embeddings
+-> one PREFILL pass through all 32 real LLaMA layers), producing an actual predicted
+action token from real weights. Full 7-token autoregressive generation (the remaining
+`Mode.DECODE` steps) isn't working yet: a single chip overflows L1 on decode's QKV
+matmul regardless of precision, and the 2-device path needs this port's custom
+embeddings correctly sharded to match the framework's own tensor-parallel convention
+-- a real, scoped next step, not attempted in a rush. See that file's module docstring
+for the full detail, including a real, reproducible `transformers` bug hit and
+root-caused along the way (non-deterministic NaN logits from its default "eager"
+attention implementation at this real sequence length -- fixed by requesting `sdpa`).
 
 ## License
 
