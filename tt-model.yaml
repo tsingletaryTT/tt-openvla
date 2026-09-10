@@ -34,7 +34,7 @@ source:
     - models/tt_transformers   # Transformer/ModelArgs this port reuses directly
     - models/common            # LightweightModule, tensor_utils, utility_functions
   extra_code:
-    - root: {repo: https://github.com/tsingletaryTT/tt-openvla, ref: 579ba8fa0c7604f898fdc0ffb1e3c748da3b462c}
+    - root: {repo: https://github.com/tsingletaryTT/tt-openvla, ref: a09e5860c70d12d33bd515246b79043a79f0246c}
       paths:
         - tt            # this port's own functional_* modules
         - gradio_app     # the demo app + the asgi.py runtime.app points at
