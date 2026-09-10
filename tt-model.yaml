@@ -34,7 +34,7 @@ source:
     - models/tt_transformers   # Transformer/ModelArgs this port reuses directly
     - models/common            # LightweightModule, tensor_utils, utility_functions
   extra_code:
-    - root: {repo: https://github.com/tsingletaryTT/tt-openvla, ref: 01c2a777f1849ad8f2b8011983a8adfc11c2e4b1}
+    - root: {repo: https://github.com/tsingletaryTT/tt-openvla, ref: daadb2d5b7a5618f40abb4cb2405123d4c8752ec}
       paths:
         - tt            # this port's own functional_* modules
         - gradio_app     # the demo app + the asgi.py runtime.app points at
@@ -44,15 +44,19 @@ source:
 runtime:
   app: "gradio_app.asgi:app"
   # Beyond tt-dit-server's own DEFAULT_PACKAGES (fastapi/uvicorn/pydantic/pillow).
-  # Exact versions pinned to what this port is actually validated against -- see
-  # gradio_app/backends.py's own notes on why a fresh unpinned install breaks things
-  # (torch/torchvision skew, transformers too new for OpenVLA's own processing code).
+  # Deliberately NOT pinning torch here: tt-dit-server's own install_lines() auto-
+  # inserts torch pinned to whatever version this image's actual compiled ttnn
+  # extension needs (metal_torch_pin), which an author-supplied torch would override.
+  # A first attempt hardcoded torch==2.7.0 (matching this repo's own LOCAL dev venv,
+  # a separate concern from the container's own ABI) and failed verify.sh with
+  # "torch 2.7.0 is installed but tt-metal pins 2.11.0" -- confirming this pin really
+  # is load-bearing, not a default worth overriding. torchvision is left unpinned for
+  # the same reason (letting dependency resolution match whatever torch lands).
   packages:
-    - torch==2.7.0
-    - torchvision==0.22.0
     - transformers==4.52.4
     - tokenizers==0.21.4
     - timm==1.0.29
+    - torchvision
     - safetensors
     - huggingface_hub
     - datasets
