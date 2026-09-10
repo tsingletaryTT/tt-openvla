@@ -9,6 +9,10 @@ as extra tokens appended to the LLaMA tokenizer's vocabulary, generated
 autoregressively like ordinary text and decoded back to continuous values via a bin
 mapping.
 
+A model card for this port is published at
+[huggingface.co/episod/tt-openvla](https://huggingface.co/episod/tt-openvla) (no
+separate checkpoint hosted there -- see its own README for why).
+
 This is a separate repo from [tt-vjepa2](https://github.com/tsingletaryTT/tt-vjepa2)
 deliberately: OpenVLA shares no architecture or checkpoint with V-JEPA2 (unlike, say,
 a hypothetical V-JEPA 2.1 bring-up, which would reuse the existing encoder port
