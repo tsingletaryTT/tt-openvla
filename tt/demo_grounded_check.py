@@ -51,7 +51,11 @@ from tt.functional_encoder import Dinov2Config, Model as Dinov2Model, timm_vit_r
 from tt.functional_llama import build_model, build_model_args, prefill_rot_mats  # noqa: E402
 from tt.functional_projector import Projector, ProjectorConfig  # noqa: E402
 from tt.functional_siglip import Model as SiglipModel, SiglipConfig  # noqa: E402
-from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict  # noqa: E402
+from tt.llama_checkpoint import (  # noqa: E402
+    get_llama2_config,
+    load_openvla_llama_state_dict,
+    openvla_hf_cache_glob_dir,
+)
 
 ACTION_DIM = 7
 UNNORM_KEY = "bridge_orig"
@@ -126,9 +130,7 @@ def get_vision_projector_weights():
         siglip_sd[f"{dst}.mlp.fc2.bias"] = raw[f"{src}.mlp.fc2.bias"]
 
     shard_path = glob.glob(
-        os.path.expanduser(
-            "~/.cache/huggingface/hub/models--openvla--openvla-7b/snapshots/*/model-00001-of-00003.safetensors"
-        )
+        os.path.join(openvla_hf_cache_glob_dir(), "model-00001-of-00003.safetensors")
     )[0]
     proj_sd = {}
     with safe_open(shard_path, framework="pt") as f:

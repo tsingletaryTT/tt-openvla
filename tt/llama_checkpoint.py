@@ -98,6 +98,17 @@ def hf_to_meta_key(hf_key: str) -> Optional[str]:
     return None
 
 
+def openvla_hf_cache_glob_dir() -> str:
+    """The glob dir for openvla-7b's local HF cache snapshot, respecting $HF_HOME the
+    way huggingface_hub itself does (defaults to ~/.cache/huggingface if unset).
+    Hardcoding ~/.cache/huggingface directly breaks whenever HF_HOME points elsewhere
+    -- e.g. tt-model-manager's own container sets HF_HOME=/hf, which os.path.expanduser
+    ignores entirely, so a hardcoded path resolves to the wrong (empty) directory
+    inside that container and silently finds zero shards."""
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    return os.path.join(hf_home, "hub", "models--openvla--openvla-7b", "snapshots", "*")
+
+
 def load_openvla_llama_state_dict(hf_cache_dir: Optional[str] = None) -> dict:
     """Loads all `language_model.*` weights from the real openvla/openvla-7b
     checkpoint's 3 safetensors shards and renames them to tt_transformers' expected
@@ -105,9 +116,7 @@ def load_openvla_llama_state_dict(hf_cache_dir: Optional[str] = None) -> dict:
     upcasting for host-side correctness comparisons; TTNN-side loaders cast to
     bf16/bfp8 themselves)."""
     if hf_cache_dir is None:
-        hf_cache_dir = os.path.expanduser(
-            "~/.cache/huggingface/hub/models--openvla--openvla-7b/snapshots/*"
-        )
+        hf_cache_dir = openvla_hf_cache_glob_dir()
     shard_paths = sorted(glob.glob(os.path.join(hf_cache_dir, "model-0000*-of-00003.safetensors")))
     assert len(shard_paths) == 3, f"expected 3 safetensors shards, found {shard_paths}"
 

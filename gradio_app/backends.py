@@ -28,7 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tt.action_detokenizer import detokenize_actions  # noqa: E402
-from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict  # noqa: E402
+from tt.llama_checkpoint import (  # noqa: E402
+    get_llama2_config,
+    load_openvla_llama_state_dict,
+    openvla_hf_cache_glob_dir,
+)
 
 ACTION_DIM = 7
 DEFAULT_UNNORM_KEY = "bridge_orig"
@@ -130,9 +134,7 @@ class ReferenceBackend:
         import glob
 
         shard_path = glob.glob(
-            os.path.expanduser(
-                "~/.cache/huggingface/hub/models--openvla--openvla-7b/snapshots/*/model-00001-of-00003.safetensors"
-            )
+            os.path.join(openvla_hf_cache_glob_dir(), "model-00001-of-00003.safetensors")
         )[0]
         self.proj_sd = {}
         with safe_open(shard_path, framework="pt") as f:
