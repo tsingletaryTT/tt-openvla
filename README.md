@@ -23,16 +23,20 @@ VisionBackbone -> Projector -> full 32-layer LLaMA-2-7B backbone -> action
 detokenization. See `tt/` for the individual modules and their correctness tests.
 
 A real "Grounded Check" demo (`tt/demo_grounded_check.py`) runs a real image and
-OpenVLA's own documented prompt through the whole pipeline (vision -> fused embeddings
--> one PREFILL pass through all 32 real LLaMA layers), producing an actual predicted
-action token from real weights. Full 7-token autoregressive generation (the remaining
-`Mode.DECODE` steps) isn't working yet: a single chip overflows L1 on decode's QKV
-matmul regardless of precision, and the 2-device path needs this port's custom
-embeddings correctly sharded to match the framework's own tensor-parallel convention
--- a real, scoped next step, not attempted in a rush. See that file's module docstring
-for the full detail, including a real, reproducible `transformers` bug hit and
-root-caused along the way (non-deterministic NaN logits from its default "eager"
-attention implementation at this real sequence length -- fixed by requesting `sdpa`).
+OpenVLA's own documented prompt through the whole pipeline end to end: vision -> fused
+embeddings -> one PREFILL pass + 6 real `Mode.DECODE` steps through all 32 real
+LLaMA-2-7B layers, on a real 2-device mesh -- producing an actual, deterministic
+decoded 7-DoF action from real weights. Getting decode working took two real fixes:
+custom embeddings needed the same tensor-parallel width-sharding
+(`ttnn.ShardTensor2dMesh`) the framework's own `Embedding` module uses internally, and
+a genuine non-determinism bug in this port's own decode-loop code (reading the wrong
+row of a batch-padded output tile -- caught by rerunning the same fixed-input,
+greedy-decoded pipeline and getting different, sometimes vocabulary-range-violating
+results each time, then reverified deterministic after the fix). See that file's
+module docstring for the full detail, including a separate, reproducible `transformers`
+library bug hit and root-caused along the way (non-deterministic NaN logits from its
+default "eager" attention implementation at this real sequence length -- fixed by
+requesting `sdpa`).
 
 ## License
 
