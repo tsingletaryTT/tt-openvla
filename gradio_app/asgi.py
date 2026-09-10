@@ -5,14 +5,29 @@ FastAPI app, since `tt-dit-server` launches a `module:attribute` ASGI callable w
 uvicorn directly rather than calling `demo.launch()` (which would start its own
 server). Backend selection is fixed to TTNNBackend here: an image served this way is
 assumed to actually have Blackhole hardware attached, unlike app.py's CLI, which
-defaults to it but allows --backend reference for CPU-only iteration."""
+defaults to it but allows --backend reference for CPU-only iteration.
 
+Follows the same two contracts tt-animatediff's own server/app.py documents for this
+kind (read that docstring for the full rationale):
+
+1. **Readiness is the lifespan.** The mesh open + model load happen in the FastAPI
+   lifespan below, awaited to completion, so uvicorn's "Application startup complete"
+   actually means the backend can serve a request -- not lazily on first request, which
+   would report ready while still loading and time out that first caller.
+2. **Importing this module must not touch hardware (or require a writable HF cache /
+   network).** `verify_lines` imports this module at image-BUILD time, on a machine
+   with no card and no writable $HF_HOME, purely to prove `runtime.app` resolves. So
+   `TTNNBackend()` is never constructed at module scope, and the one HF metadata fetch
+   this module needs (the demo's dropdown of `unnorm_keys`) degrades to a static
+   fallback instead of failing import if the cache/network isn't available."""
+
+import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
 
 from fastapi import FastAPI
-from huggingface_hub import hf_hub_download
 
 import gradio as gr
 
@@ -20,40 +35,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import build_app  # noqa: E402
 from backends import TTNNBackend  # noqa: E402
 
+# The only unnorm_key this demo actually defaults to (see app.py's build_app) -- used
+# as-is if the real list can't be fetched at import time (no writable HF cache, or no
+# network, in the image-build sandbox verify.sh runs in).
+_FALLBACK_UNNORM_KEYS = ["bridge_orig"]
 
-class _LazyTTNNBackend:
-    """Defers `TTNNBackend.__init__` (opens a real 2-device Blackhole mesh) until the
-    first actual prediction request. tt-dit-server's own verify.sh imports this module
-    at image BUILD time, with no device passthrough or gozer lease -- constructing the
-    real backend eagerly at import time would try to open hardware during `docker
-    build` itself, not at `tt-model serve` time."""
+
+def _resolve_unnorm_keys() -> list[str]:
+    try:
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download("openvla/openvla-7b", "config.json")
+        return sorted(json.load(open(config_path))["norm_stats"].keys())
+    except Exception:
+        return _FALLBACK_UNNORM_KEYS
+
+
+class _BackendHandle:
+    """Stands in for a real TTNNBackend while the Gradio Blocks graph is being built
+    (import time -- before any device is open). The lifespan below constructs the real
+    backend and installs it via `set()` before uvicorn reports startup complete."""
 
     name = TTNNBackend.name
 
-    def __init__(self, *args, **kwargs):
-        self._args = args
-        self._kwargs = kwargs
+    def __init__(self):
         self._real: TTNNBackend | None = None
 
-    def _get(self) -> TTNNBackend:
-        if self._real is None:
-            self._real = TTNNBackend(*self._args, **self._kwargs)
-        return self._real
+    def set(self, real: TTNNBackend) -> None:
+        self._real = real
 
     def predict_action(self, *args, **kwargs):
-        return self._get().predict_action(*args, **kwargs)
+        if self._real is None:
+            raise RuntimeError("backend not ready -- called before lifespan startup completed")
+        return self._real.predict_action(*args, **kwargs)
 
-    def close(self):
+    def close(self) -> None:
         if self._real is not None:
             self._real.close()
 
 
-_backend = _LazyTTNNBackend()
+_backend = _BackendHandle()
+_demo = build_app(_backend, _resolve_unnorm_keys())
 
-_config_path = hf_hub_download("openvla/openvla-7b", "config.json")
-_unnorm_keys = sorted(json.load(open(_config_path))["norm_stats"].keys())
 
-_demo = build_app(_backend, _unnorm_keys)
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI):
+    real_backend = await asyncio.to_thread(TTNNBackend)
+    _backend.set(real_backend)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(_backend.close)
 
-app = FastAPI()
+
+app = FastAPI(lifespan=_lifespan)
 app = gr.mount_gradio_app(app, _demo, path="/")
