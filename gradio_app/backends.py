@@ -235,17 +235,40 @@ class TTNNBackend:
         self.cfg = get_llama2_config()
         self.llama_sd = load_openvla_llama_state_dict()
 
+        # Fabric init + mesh open, matched byte-for-byte against the real, currently
+        # published, working multi-chip tt-dit-server on this exact QB2 hardware
+        # shape (episod/tt-model stisiTT/flux2-dev-qb2's own
+        # models/tt_dit/server/flux2/device.py, itself mirroring conftest.py's
+        # set_fabric/mesh_device fixtures) -- pulled and read directly, not
+        # reconstructed from memory. Two real gaps vs. what this file had before:
+        # 1. A bare `ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)` only sets
+        #    the first of 6 positional args; the rest silently take the API's own
+        #    defaults instead of the ones the tested path always sets explicitly
+        #    (reliability_mode=STRICT_INIT, fabric_tensix_config=DISABLED,
+        #    fabric_manager=DEFAULT, FabricUDMMode.DISABLED).
+        # 2. `open_mesh_device` was never given an explicit `dispatch_core_config` --
+        #    the working recipe always builds one tying dispatch core config to the
+        #    SAME fabric_tensix_config passed to set_fabric_config, since Blackhole's
+        #    ROW dispatch axis needs both fabric AND tensix config set together or it
+        #    silently misconfigures (their own device.py's comment on this exact
+        #    point).
         print("[ttnn] setting fabric config...")
-        # NOT a bare `True` -- models/tt_transformers/conftest.py's own device_params
-        # fixture treats `True` as a placeholder it translates to this exact enum
-        # value before it ever reaches ttnn.set_fabric_config() for a non-galaxy mesh
-        # (see its `elif params["fabric_config"] == True:` branch). Passing `True`
-        # straight to the real API lets Python coerce it to whatever FabricConfig enum
-        # value happens to sit at the underlying int, not necessarily FABRIC_1D.
-        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        fabric_tensix_config = ttnn.FabricTensixConfig.DISABLED
+        reliability_mode = ttnn.FabricReliabilityMode.STRICT_INIT
+        fabric_manager = ttnn.FabricManagerMode.DEFAULT
+        ttnn.set_fabric_config(
+            ttnn.FabricConfig.FABRIC_1D,
+            reliability_mode,
+            None,
+            fabric_tensix_config,
+            ttnn.FabricUDMMode.DISABLED,
+            fabric_manager,
+        )
 
         print("[ttnn] opening 1x2 mesh device...")
-        open_kwargs = {}
+        open_kwargs = {
+            "dispatch_core_config": ttnn.DispatchCoreConfig(None, None, fabric_tensix_config),
+        }
         if mesh_physical_device_ids is not None:
             open_kwargs["physical_device_ids"] = mesh_physical_device_ids
         self.mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), **open_kwargs)
