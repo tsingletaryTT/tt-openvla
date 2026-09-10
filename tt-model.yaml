@@ -1,0 +1,82 @@
+# tt-model-manager container (v5.1) manifest for the OpenVLA Gradio demo.
+#
+# Status: authored and validated as far as this session got -- see this repo's
+# README for the actual outcome of attempting `tt-model package --container` with
+# this file. tt-model-manager's own docs mark the whole container path
+# "Experimental -- no support, no guarantees," and `tt-dit-server` (the kind used
+# here, since OpenVLA has no tokens/KV-cache/vLLM engine any more than a diffusion
+# model does) has so far only been exercised by actual diffusion models
+# (FLUX.2-dev, tt-animatediff, tt-skyreels) -- this would be the first non-diffusion
+# model on this path, so treat any failure here as "first attempt at new territory,"
+# not a regression.
+
+schema: "5.1"
+
+repo: episod/tt-openvla-serving   # container image target -- SEPARATE from the
+                                  # episod/tt-openvla model card, which hosts no
+                                  # checkpoint of its own (see that repo's README)
+name: tt-openvla
+# A bare id (no revision pin) -- openvla-7b's own real checkpoint, the same one this
+# whole port validates against. Not re-hosted anywhere else; see llama_checkpoint.py's
+# module docstring for why this port never touches the separate meta-llama checkpoint.
+weights: openvla/openvla-7b
+
+kind: tt-dit-server   # no tokens, no KV cache, no continuous batching -- same reason
+                       # a diffusion model uses this kind, not vllm-plugin/vllm-fork
+arch: blackhole
+
+image:
+  registry: hf
+
+source:
+  tt_metal: /home/ttuser/code/tt-metal-vjepa2-bringup
+  code:
+    - models/tt_transformers   # Transformer/ModelArgs this port reuses directly
+    - models/common            # LightweightModule, tensor_utils, utility_functions
+  extra_code:
+    - root: {repo: https://github.com/tsingletaryTT/tt-openvla, ref: 01c2a777f1849ad8f2b8011983a8adfc11c2e4b1}
+      paths:
+        - tt            # this port's own functional_* modules
+        - gradio_app     # the demo app + the asgi.py runtime.app points at
+  ubuntu: "22.04"
+  python: "3.12"
+
+runtime:
+  app: "gradio_app.asgi:app"
+  # Beyond tt-dit-server's own DEFAULT_PACKAGES (fastapi/uvicorn/pydantic/pillow).
+  # Exact versions pinned to what this port is actually validated against -- see
+  # gradio_app/backends.py's own notes on why a fresh unpinned install breaks things
+  # (torch/torchvision skew, transformers too new for OpenVLA's own processing code).
+  packages:
+    - torch==2.7.0
+    - torchvision==0.22.0
+    - transformers==4.52.4
+    - tokenizers==0.21.4
+    - timm==1.0.29
+    - safetensors
+    - huggingface_hub
+    - datasets
+    - gradio
+  # NOTE: gradio_app/backends.py's TTNNBackend hardcodes a 1x2 mesh -- it does not
+  # yet read this env var to size itself dynamically. Declared for schema
+  # completeness / a future improvement, not because the server consumes it today.
+  mesh_shape_env: OPENVLA_MESH_SHAPE
+
+serve:
+  port: 8000
+  hardware: p300
+  mesh_device: P300   # tt-model-manager's own preset for this exact board: (1, 2)
+
+verify:
+  - "import gradio_app.asgi as m; assert m.app"
+
+card:
+  description: >
+    A from-scratch TTNN port of OpenVLA-7B (vision-language-action model for robot
+    manipulation) for Tenstorrent Blackhole -- a real image + instruction in, a real
+    predicted 7-DoF action out, via a Gradio UI.
+  quickstart: |
+    ### Use the demo
+    Open the URL `tt-model serve` prints once the server is up -- a Gradio UI, not an
+    API. Upload an image, enter an instruction, and click "Predict action" to run a
+    real forward pass through the full DINOv2+SigLIP+LLaMA-2-7B pipeline.
