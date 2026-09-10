@@ -20,7 +20,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import build_app  # noqa: E402
 from backends import TTNNBackend  # noqa: E402
 
-_backend = TTNNBackend()
+
+class _LazyTTNNBackend:
+    """Defers `TTNNBackend.__init__` (opens a real 2-device Blackhole mesh) until the
+    first actual prediction request. tt-dit-server's own verify.sh imports this module
+    at image BUILD time, with no device passthrough or gozer lease -- constructing the
+    real backend eagerly at import time would try to open hardware during `docker
+    build` itself, not at `tt-model serve` time."""
+
+    name = TTNNBackend.name
+
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+        self._real: TTNNBackend | None = None
+
+    def _get(self) -> TTNNBackend:
+        if self._real is None:
+            self._real = TTNNBackend(*self._args, **self._kwargs)
+        return self._real
+
+    def predict_action(self, *args, **kwargs):
+        return self._get().predict_action(*args, **kwargs)
+
+    def close(self):
+        if self._real is not None:
+            self._real.close()
+
+
+_backend = _LazyTTNNBackend()
 
 _config_path = hf_hub_download("openvla/openvla-7b", "config.json")
 _unnorm_keys = sorted(json.load(open(_config_path))["norm_stats"].keys())

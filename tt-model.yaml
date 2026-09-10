@@ -61,6 +61,26 @@ runtime:
     - huggingface_hub
     - datasets
     - gradio
+    # Everything below is pulled in transitively by tt-metal's own
+    # models/common + models/tt_transformers modules (loguru for its logger,
+    # pytest because utility_functions.py imports it unconditionally, the rest
+    # via tracy/profiler tooling) -- the same set this repo's own local dev
+    # venv needed to import those modules at all.
+    - loguru
+    - pytest
+    - tqdm
+    - pyyaml
+    - tomlkit
+    - networkx
+    - graphviz
+    - click
+    - seaborn
+    - scipy
+    - matplotlib
+    - pandas
+    - rich
+    - requests
+    - psutil
   # NOTE: gradio_app/backends.py's TTNNBackend hardcodes a 1x2 mesh -- it does not
   # yet read this env var to size itself dynamically. Declared for schema
   # completeness / a future improvement, not because the server consumes it today.
