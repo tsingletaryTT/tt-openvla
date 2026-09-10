@@ -178,14 +178,31 @@ class ReferenceBackend:
 
 class TTNNBackend:
     """This repo's own TTNN port, real Blackhole hardware. Caller must already hold a
-    gozer lease covering 2 chips and have TT_VISIBLE_DEVICES set -- this class does not
-    acquire one. Needs a real 2-device mesh (not 1) -- see
-    tt/demo_grounded_check.py's mesh-device comment for why a single chip overflows L1
-    in decode mode, and why custom embeddings need explicit tensor-parallel sharding."""
+    gozer lease covering 4 chips and have TT_VISIBLE_DEVICES set -- this class does not
+    acquire one.
+
+    Needs 4 chips, not 2: the LLaMA-2-7B backbone needs a real 2-device
+    tensor-parallel mesh (see tt/demo_grounded_check.py's mesh-device comment for why
+    a single chip overflows L1 in decode mode). Vision runs on the SAME mesh, not a
+    separate single-device context -- confirmed directly: opening a plain single
+    device for vision AND a 2-device mesh at the same time in one process hangs the
+    mesh's inter-chip fabric handshake ("Fabric Router Sync: Timeout... Ethernet
+    handshake likely failed"), REGARDLESS of whether the single device and the mesh
+    are pinned to non-overlapping physical chips (tried both: same chips, and
+    `physical_device_ids` pointing the mesh at two entirely different chips -- same
+    timeout either way). tt-metal's fabric/control-plane initialization appears to be
+    a process-wide singleton that a plain `open_device()` and a simultaneously-open
+    `open_mesh_device()` can't both use. Fix: one mesh device for everything. Vision's
+    own `ttnn.from_torch(..., device=mesh_device)` calls (no explicit mesh_mapper)
+    default to REPLICATING across both chips -- wasteful (the same vision forward runs
+    twice) but correct, and simpler than sharding a computation that doesn't need
+    tensor parallelism. Reading a replicated result back uses
+    `ttnn.get_device_tensors(tensor)[0]` (take the first chip's identical copy), the
+    same pattern tt-vjepa2's own `open_vla.py` reference uses for exactly this."""
 
     name = "ttnn-blackhole"
 
-    def __init__(self, tt_metal_home: str | None = None, vision_device_id: int = 0):
+    def __init__(self, tt_metal_home: str | None = None, mesh_physical_device_ids: list[int] | None = None):
         tt_metal_home = tt_metal_home or os.environ.get("TT_METAL_HOME")
         if not tt_metal_home:
             raise RuntimeError("Set TT_METAL_HOME (or pass tt_metal_home=) to a tt-metal checkout.")
@@ -212,18 +229,24 @@ class TTNNBackend:
         self.cfg = get_llama2_config()
         self.llama_sd = load_openvla_llama_state_dict()
 
-        print("[ttnn] opening vision device + building DINOv2/SigLIP/Projector...")
-        self.vision_device = ttnn.open_device(device_id=vision_device_id)
+        print("[ttnn] setting fabric config...")
+        ttnn.set_fabric_config(True)
+
+        print("[ttnn] opening 1x2 mesh device...")
+        open_kwargs = {}
+        if mesh_physical_device_ids is not None:
+            open_kwargs["physical_device_ids"] = mesh_physical_device_ids
+        self.mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2), **open_kwargs)
+
+        print("[ttnn] building DINOv2/SigLIP/Projector on the mesh (replicated)...")
         dcfg, dinov2_sd, scfg, siglip_sd, pcfg, proj_sd = get_vision_projector_weights()
-        self.dinov2 = Dinov2Model.from_state_dict(dinov2_sd, cfg=dcfg, device=self.vision_device)
-        self.siglip = SiglipModel.from_state_dict(siglip_sd, cfg=scfg, device=self.vision_device)
+        self.dinov2 = Dinov2Model.from_state_dict(dinov2_sd, cfg=dcfg, device=self.mesh_device)
+        self.siglip = SiglipModel.from_state_dict(siglip_sd, cfg=scfg, device=self.mesh_device)
         self.backbone = VisionBackbone.from_models(self.dinov2, self.siglip)
-        self.projector = Projector.from_state_dict(proj_sd, cfg=pcfg, device=self.vision_device)
+        self.projector = Projector.from_state_dict(proj_sd, cfg=pcfg, device=self.mesh_device)
         self.pcfg = pcfg
 
-        print("[ttnn] setting fabric config + opening 1x2 mesh device for LLaMA-2-7B...")
-        ttnn.set_fabric_config(True)
-        self.mesh_device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 2))
+        print("[ttnn] building LLaMA-2-7B on the same mesh...")
         # A fixed max_seq_len is chosen up front so the Transformer is built once here,
         # not rebuilt per call -- generously covers a normal instruction-length prompt
         # (real prompts in the OpenVLA paper's examples run well under 64 tokens) plus
@@ -240,12 +263,15 @@ class TTNNBackend:
     def close(self):
         self.ttnn.close_mesh_device(self.mesh_device)
         self.ttnn.set_fabric_config(self.ttnn.FabricConfig.DISABLED)
-        self.ttnn.close_device(self.vision_device)
 
     def _run_vision(self, pixel_values: torch.Tensor) -> torch.Tensor:
         fused_patches_tt = self.backbone.forward(pixel_values)
         vision_embeds_tt = self.projector(fused_patches_tt)
-        return self.ttnn.to_torch(vision_embeds_tt).reshape(1, 256, self.pcfg.llm_dim).float()
+        # Replicated across both mesh devices (no mesh_mapper was given, the default);
+        # take one chip's copy rather than composing, since both are identical -- same
+        # pattern tt-vjepa2's own gradio_app-adjacent open_vla.py reference uses.
+        single_shard = self.ttnn.get_device_tensors(vision_embeds_tt)[0]
+        return self.ttnn.to_torch(single_shard).reshape(1, 256, self.pcfg.llm_dim).float()
 
     def predict_action(self, image, prompt: str, unnorm_key: str = DEFAULT_UNNORM_KEY) -> dict:
         ttnn, Mode = self.ttnn, self.Mode

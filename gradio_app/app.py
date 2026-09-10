@@ -102,7 +102,6 @@ to demonstrate a semantically correct drawer-opening prediction."""
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["ttnn", "reference"], default="ttnn")
-    parser.add_argument("--vision-device-id", type=int, default=0)
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
@@ -122,7 +121,7 @@ def main():
     if args.backend == "ttnn":
         from backends import TTNNBackend
 
-        backend = TTNNBackend(vision_device_id=args.vision_device_id)
+        backend = TTNNBackend()
     else:
         from backends import ReferenceBackend
 
