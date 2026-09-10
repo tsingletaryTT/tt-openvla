@@ -213,6 +213,10 @@ class TTNNBackend:
         import ttnn
         from models.tt_transformers.tt.common import Mode
 
+        from tt.tt_metal_patches import apply as _apply_tt_metal_patches
+
+        _apply_tt_metal_patches()
+
         from tt.demo_grounded_check import ACTION_DIM as _AD  # noqa: F401 (sanity: keep in sync)
         from tt.demo_grounded_check import build_fused_embeddings, get_vision_projector_weights
         from tt.functional_encoder import Model as Dinov2Model
