@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tt-openvla-serving"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenVLA-7B (vision-language-action) on Tenstorrent Blackhole via TTNN. `uv build` here packages the FULL gradio_app/ and tt/ trees, bring-up scripts and tests included -- fine for local dev/reinstall, but NOT what episod/tt-openvla's published bundle ships. That wheel is a hand-curated, narrower build containing only the served-path closure gradio_app/backends.py actually reaches: action_detokenizer, llama_checkpoint, tt_metal_patches, demo_grounded_check, functional_{encoder,llama,projector,siglip,vision_backbone} -- benchmark.py, cpu_benchmark.py, and test_*.py are excluded from it. setuptools' packages.find has no clean way to drop individual top-level modules from an included package without moving them out of tt/, which would break the paths this repo's own docs and scripts already reference -- so that curation step is manual for now; see episod/tt-openvla's own README for exactly what the published wheel contains."
 requires-python = ">=3.10"
 

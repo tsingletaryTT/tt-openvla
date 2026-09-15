@@ -28,13 +28,25 @@ import os
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI
+import numpy as np
+from fastapi import FastAPI, Request
+from PIL import Image
+from starlette.responses import JSONResponse
 
 import gradio as gr
+import json_numpy
+
+# Must run before any json.dumps/loads touches a request or response body carrying a
+# numpy array (the /act route below): this monkey-patches the stdlib json module in
+# place, so ordinary json.loads/json.dumps -- including the ones Starlette's own
+# Request.json()/JSONResponse.render() call internally -- become numpy-aware. Patching
+# at import time, not lazily inside the route, so there's no window where a request
+# could be served before it's active.
+json_numpy.patch()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import build_app  # noqa: E402
-from backends import TTNNBackend  # noqa: E402
+from backends import DEFAULT_UNNORM_KEY, TTNNBackend  # noqa: E402
 
 # The only unnorm_key this demo actually defaults to (see app.py's build_app) -- used
 # as-is if the real list can't be fetched at import time (no writable HF cache, or no
@@ -108,9 +120,31 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
+
+
+@app.post("/act")
+async def act(request: Request) -> JSONResponse:
+    """Mirrors openvla/openvla's own reference server (`vla-scripts/deploy.py`)
+    exactly, so existing OpenVLA client code / robot-control loops written against
+    that server work against this bundle unmodified: POST a JSON body
+    {"image": <uint8 HxWx3 array>, "instruction": "<string>", "unnorm_key": "<string,
+    optional>"} (numpy-aware JSON via json_numpy.patch(), applied at import time
+    above) and get back {"action": <float array>}. Reuses the exact backend instance
+    the Gradio UI calls (same loaded weights, same mesh) -- no separate model load."""
+    payload = await request.json()
+    image = Image.fromarray(np.asarray(payload["image"], dtype=np.uint8)).convert("RGB")
+    instruction = payload["instruction"]
+    unnorm_key = payload.get("unnorm_key", DEFAULT_UNNORM_KEY)
+    full_prompt = f"In: What action should the robot take to {instruction.strip().rstrip('?')}?\nOut:"
+    result = await asyncio.to_thread(_backend.predict_action, image, full_prompt, unnorm_key=unnorm_key)
+    return JSONResponse(content={"action": result["action"]})
+
+
 # path="/" (not "") makes Starlette's Mount 307-redirect "/" -> "//" -- reproduced in
 # isolation outside this container with a minimal gr.Blocks() + mount_gradio_app, so
 # it's a real gradio/Starlette root-mount quirk, not something specific to this app.
 # The client bundle then throws `Invalid URL` trying to parse a config value built
-# from the doubled path, and the UI never gets past "Loading...".
+# from the doubled path, and the UI never gets past "Loading...". The /act route
+# above is registered on `app` before this mount, so Starlette matches it first --
+# mount_gradio_app's root-path mount would otherwise shadow it.
 app = gr.mount_gradio_app(app, _demo, path="")
