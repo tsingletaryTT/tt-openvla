@@ -98,16 +98,20 @@ Two publishing surfaces beyond GitHub + the HF model card above:
 
 - **[tt-discolike](https://github.com/tsingletaryTT/tt-discolike)**: done, see
   *Interactive demo* above.
-- **[tt-model-manager](https://github.com/tenstorrent/tt-model-manager)**
-  (`tt-model.yaml`, `kind: tt-dit-server`): authored and validates cleanly against the
-  tool's own schema checks, but actually building the container is blocked on this
-  machine's shared TT_METAL_HOME checkout having uninitialized git submodules (`git
-  submodule update --init --recursive` would fix it, not run here since that checkout
-  is shared with other concurrent work on this machine). tt-model-manager's own docs
-  mark the whole container path "Experimental -- no support, no guarantees," and this
-  would be the first non-diffusion model on the `tt-dit-server` kind (so far only
-  exercised by FLUX.2-dev/tt-animatediff/tt-skyreels) -- treat completing this as a
-  real, scoped, but not-yet-done next step, not a broken promise.
+- **[tt-model-manager](https://github.com/tenstorrent/tt-model-manager)**: done, as a
+  v6 **thin** bundle (`tt-model pull episod/tt-openvla --with-weights && tt-model serve
+  episod/tt-openvla`) -- the earlier `tt-model.yaml` v5.1 CONTAINER attempt is gone
+  (that whole schema is no longer the project's target; its build was blocked on this
+  machine's shared TT_METAL_HOME checkout having uninitialized git submodules, never
+  resolved). `pyproject.toml` builds `tt-openvla-serving`, the served-path closure
+  (`gradio_app`'s ASGI app + the `tt/` functional_* modules it reaches); a second wheel
+  vendors the `models/common` + `models/tt_transformers/tt` closure already
+  hardware-verified the same day for episod/tt-tnt (identical tt-metal v0.77.0 source).
+  This was the first non-diffusion model on the `tt-dit-server` kind (so far only
+  exercised by FLUX.2-dev/tt-animatediff/tt-skyreels) -- hardware-verified end to end:
+  mesh open on a real 2-chip P300, weights fetched, and a real prediction through the
+  Gradio UI returned a genuine 7-DoF action (dx/dy/dz/droll/dpitch/dyaw/gripper) in
+  ~45s on a cold cache.
 
 ## License
 
