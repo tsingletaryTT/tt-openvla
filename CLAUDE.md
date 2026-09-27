@@ -78,3 +78,17 @@ fix the reference bugs rather than regenerate numbers against a broken reference
 **Open:** full 7/7 exact match needs a precision change (fp32 LM head / higher-fidelity
 decode), untried. tt_transformers `ModelArgs` still fetches `NousResearch/Llama-2-7b-hf`
 config/tokenizer at startup (small, undeclared download).
+
+### 2026-09-27 — PR #1 review fixes (still 0.2.0, unreleased)
+- `/act` with a non-string `instruction` returned an unhandled 500; it is now validated inside
+  the payload `try` and returns the documented 400.
+- The converted-weight cache for a LOCAL `HF_MODEL` dir was keyed on the literal `local`, so
+  two local checkpoints (or one updated in place) could silently share a stale cache. It is now
+  keyed on `openvla_weights.local_checkpoint_fingerprint()`: resolved path + each shard/index
+  file's name, size and mtime.
+- `tt/hf_reference.py` duplicated the pinned sha (and treated an exported-but-empty
+  `TT_MODEL_WEIGHTS_REVISION` as the revision ""); it now uses `openvla_weights.weights_revision()`.
+- `tt/test_demo_grounded_check.py` records `REFERENCE_REVISION` and refuses to compare against a
+  different checkpoint instead of reporting a meaningless pass/fail.
+- New CPU-only `tt/test_serving_review_fixes.py` (ttnn import-blocked): 9 tests, all seen to
+  fail against the previous head, pass now.

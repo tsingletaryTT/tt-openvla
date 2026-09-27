@@ -31,7 +31,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-REV = os.environ.get("TT_MODEL_WEIGHTS_REVISION", "47a0ec7fc4ec123775a391911046cf33cf9ed83f")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from tt.openvla_weights import weights_revision  # noqa: E402  (ttnn-free: torch + safetensors)
+
+REV = weights_revision()
 
 
 def load_cases(path):

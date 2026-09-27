@@ -49,6 +49,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "gradio_app"))
 
+#: The revision the two reference fixtures below were recorded against (upstream HF fp32).
+#: Any other checkpoint makes them meaningless, so the check refuses to run rather than
+#: report a spurious pass or fail.
+REFERENCE_REVISION = "47a0ec7fc4ec123775a391911046cf33cf9ed83f"
 REFERENCE_GENERATED_IDS = [31885, 31872, 31852, 31881, 31894, 31876, 31744]
 REFERENCE_ACTION_BRIDGE_ORIG = [-0.00311655, -0.00042412, 0.01223037, -0.00524763, -0.02221627, -0.0081257, 0.99607843]
 INSTRUCTION = "open the drawer"
@@ -59,6 +63,18 @@ def main():
     from PIL import Image
 
     from backends import ACTION_DIM, TTNNBackend, build_openvla_prompt
+    from tt.openvla_weights import PINNED_REVISION, weights_revision
+
+    assert PINNED_REVISION == REFERENCE_REVISION, (
+        "PINNED_REVISION moved: re-record REFERENCE_GENERATED_IDS / REFERENCE_ACTION_BRIDGE_ORIG "
+        "with tt/hf_reference.py at the new revision, then update REFERENCE_REVISION"
+    )
+    if weights_revision() != REFERENCE_REVISION:
+        sys.exit(
+            f"refusing to compare: weights revision {weights_revision()} is not the one the "
+            f"reference fixtures were recorded at ({REFERENCE_REVISION}); unset "
+            "TT_MODEL_WEIGHTS_REVISION or re-record the fixtures"
+        )
 
     image = Image.open(REPO_ROOT / "gradio_app" / "assets" / "example.jpg").convert("RGB")
     backend = TTNNBackend()

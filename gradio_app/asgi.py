@@ -168,12 +168,13 @@ async def act(request: Request) -> JSONResponse:
         payload, _was_encoded = _parse_act_payload(await request.json())
         image = Image.fromarray(np.asarray(payload["image"], dtype=np.uint8)).convert("RGB")
         instruction = payload["instruction"]
+        if not isinstance(instruction, str):
+            raise TypeError(f"instruction must be a string, got {type(instruction).__name__}")
+        prompt = build_openvla_prompt(instruction)
         unnorm_key = payload.get("unnorm_key") or DEFAULT_UNNORM_KEY
     except (KeyError, ValueError, TypeError) as e:
         return JSONResponse(status_code=400, content={"detail": f"bad /act payload: {e!r}"})
-    result = await asyncio.to_thread(
-        _backend.predict_action, image, build_openvla_prompt(instruction), unnorm_key=unnorm_key
-    )
+    result = await asyncio.to_thread(_backend.predict_action, image, prompt, unnorm_key=unnorm_key)
     return JSONResponse(content={"action": [float(x) for x in result["action"]]})
 
 

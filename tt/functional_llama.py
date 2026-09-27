@@ -76,10 +76,12 @@ class OpenVLALlamaArgs(ModelArgs):
         only (e.g. `layers.0.attention.wqkv_sharded_2d...tensorbin`), so a cache written by
         0.1.1 -- un-permuted wq/wk, and possibly another checkpoint revision -- would be
         reloaded silently after this fix. Keying the dir on the revision + the q/k layout
-        makes a stale cache miss instead of load."""
-        from tt.openvla_weights import model_id, weights_revision
+        makes a stale cache miss instead of load. A local checkpoint dir has no revision, so
+        it is keyed on a fingerprint of its path and shard files instead."""
+        from tt.openvla_weights import local_checkpoint_fingerprint, model_id, weights_revision
 
-        tag = "local" if os.path.isdir(model_id()) else weights_revision()[:12]
+        src = model_id()
+        tag = f"local-{local_checkpoint_fingerprint(src)}" if os.path.isdir(src) else weights_revision()[:12]
         base = super().weight_cache_path(dtype)
         return base.parent / f"openvla-7b-{tag}-qk-meta" / base.name
 

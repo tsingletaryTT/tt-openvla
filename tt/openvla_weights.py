@@ -94,6 +94,20 @@ def model_id() -> str:
     return _HF_MODEL_AT_IMPORT or DEFAULT_REPO_ID
 
 
+def local_checkpoint_fingerprint(path: str) -> str:
+    """12-hex id for a local checkpoint dir: its resolved path plus each weight/index file's
+    name, size and mtime. Two different dirs, or one updated in place, get different
+    tensor caches; hashing the multi-GB contents would cost more than the conversion."""
+    import hashlib
+
+    root = Path(path).resolve()
+    h = hashlib.sha256(str(root).encode())
+    for f in sorted(root.glob("*.safetensors")) + sorted(root.glob("*.index.json")):
+        st = f.stat()
+        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+    return h.hexdigest()[:12]
+
+
 def weights_revision() -> str:
     """The revision to fetch: `$TT_MODEL_WEIGHTS_REVISION`, else the pinned sha."""
     return os.environ.get("TT_MODEL_WEIGHTS_REVISION") or PINNED_REVISION
