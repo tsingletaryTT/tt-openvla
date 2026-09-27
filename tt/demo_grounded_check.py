@@ -4,30 +4,33 @@ full pipeline (VisionBackbone -> Projector -> fused embeddings -> LLaMA-2-7B pre
 7 greedy decode steps -> action detokenization), producing an actual 7-DoF action --
 not a synthetic shape/PCC check, a real inference.
 
-Image: `huggingface/cats-image` (a real photograph -- NOT a matched robot scene; the
+Image: `gradio_app/assets/example.jpg` (the COCO "two cats on a couch" photo, the same
+picture as `huggingface/cats-image`; a real photograph -- NOT a matched robot scene; the
 several real BridgeData V2/Open-X-Embodiment image sources this port tried were either
-stale (a specific rail.eecs.berkeley.edu path returned 404, the dataset having moved
-since older reference code was written) or not easily streamable as plain images in
-this environment. Documented honestly: this demo proves the full real-weight pipeline
-runs and produces a coherent, real-model-driven action, not that the ANSWER is
-semantically meaningful for opening a drawer.
+stale or not easily streamable as plain images in this environment). Documented
+honestly: this demo proves the full real-weight pipeline runs and reproduces OpenVLA's
+own output for this input, not that the ANSWER is semantically meaningful for opening a
+drawer. (Earlier versions pulled the image via `datasets.load_dataset`; the bundled file
+removes that network dependency.)
 
-Prompt: OpenVLA's own real, documented format, `"In: {instruction}\\nOut:"`.
+Prompt: upstream deploy.py's exact format,
+`"In: What action should the robot take to {instruction.lower()}?\nOut:"`, tokenized by
+openvla-7b's own processor, then with token 29871 appended the way upstream
+`predict_action` does (tt/openvla_weights.py's `append_empty_token`; versions before
+0.2.0 skipped it).
 
-Ground truth: OpenVLA's own bundled `modeling_prismatic.py` (loadable via
-`AutoModelForVision2Seq.from_pretrained("openvla/openvla-7b", trust_remote_code=True)`)
-hard-requires `timm < 1.0.0`, incompatible with the `timm>=1.0.10` this repo's own
-DINOv2/SigLIP work depends on -- so instead of fighting that pin, the reference is this
-port's own composed PyTorch pipeline (real timm vision towers, run the same way
-functional_vision_backbone.py's own test does, + real `transformers.LlamaForCausalLM`
-built from `llama_checkpoint.py`'s exact weights, `.generate()`d with `do_sample=False`
-to match OpenVLA's own standard greedy-decoding evaluation mode) -- see
-`test_demo_grounded_check.py`'s `reference_generate()`. Full 7-token exact match isn't
-expected or asserted: action tokens have very small logit gaps between correct and
-incorrect predictions (documented directly by tt-metal's own team), so divergence at
-bf16-ish precision is real and compounds autoregressively -- what's checked is that the
-generated tokens land in the same bin-index neighborhood as the reference, and that a
-finite, well-formed 7-DoF action comes out the other end."""
+Weights: everything -- both vision towers, projector, LLaMA -- from openvla-7b's own
+checkpoint at the pinned revision (tt/openvla_weights.py). Versions before 0.2.0 used
+timm's generic pretrained towers; see `get_vision_projector_weights`.
+
+Ground truth: the REAL upstream model, `AutoModelForVision2Seq.from_pretrained(
+"openvla/openvla-7b", trust_remote_code=True, revision=<pinned>).predict_action(...)`,
+on CPU. Its modeling_prismatic.py hard-requires timm 0.9.x, which this port's serving
+stack (timm 1.x) can't import alongside, so it runs in a separate venv; the recorded
+token ids live in test_demo_grounded_check.py (REFERENCE_GENERATED_IDS) with the recipe
+to regenerate them. Earlier versions compared against this port's own composed PyTorch
+pipeline, which shared both the generic-tower bug and the missing-29871 bug with the
+TTNN path, so agreement with it proved nothing about agreement with OpenVLA."""
 
 from __future__ import annotations
 
@@ -51,93 +54,54 @@ from tt.functional_encoder import Dinov2Config, Model as Dinov2Model, timm_vit_r
 from tt.functional_llama import build_model, build_model_args, prefill_rot_mats  # noqa: E402
 from tt.functional_projector import Projector, ProjectorConfig  # noqa: E402
 from tt.functional_siglip import Model as SiglipModel, SiglipConfig  # noqa: E402
-from tt.llama_checkpoint import (  # noqa: E402
-    get_llama2_config,
-    load_openvla_llama_state_dict,
-    openvla_hf_cache_glob_dir,
-)
+from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict  # noqa: E402
+from tt.openvla_weights import append_empty_token, load_config, load_processor  # noqa: E402
 
 ACTION_DIM = 7
 UNNORM_KEY = "bridge_orig"
+EXAMPLE_IMAGE_PATH = Path(__file__).resolve().parents[1] / "gradio_app" / "assets" / "example.jpg"
 
 
 def get_real_inputs():
     """Real image + real prompt, through OpenVLA's own real processor -- exactly the
     same preprocessing (6-channel dual-normalized pixel_values, tokenized prompt) the
     real model itself uses. See module docstring for the image-source note."""
-    from datasets import load_dataset
-    from transformers import AutoProcessor
+    from PIL import Image
 
-    processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
-    dataset = load_dataset("huggingface/cats-image")["test"]
-    image = dataset[0]["image"].convert("RGB")
+    processor = load_processor()  # pinned revision -- it runs upstream remote code
+    image = Image.open(EXAMPLE_IMAGE_PATH).convert("RGB")
     prompt = "In: What action should the robot take to open the drawer?\nOut:"
     inputs = processor(prompt, image)
-    return inputs["pixel_values"], inputs["input_ids"], processor
+    # Same fix-up upstream predict_action applies before generating (see module docstring).
+    return inputs["pixel_values"], append_empty_token(inputs["input_ids"]), processor
 
 
 def get_vision_projector_weights():
-    """Loads the real openvla-7b vision-tower + projector weights -- same sources
-    already validated independently in functional_encoder/siglip/projector's own
-    tests, gathered here for the demo's single forward pass."""
-    import glob
-    import timm
-    from safetensors import safe_open
+    """openvla-7b's OWN fine-tuned vision towers + projector, from its safetensors shards,
+    mapped into the state-dict format this port's TTNN modules read.
+
+    Before tt-openvla-serving 0.2.0 this function built both towers from timm's GENERIC
+    pretrained checkpoints (`timm.create_model(..., pretrained=True)` for
+    `vit_large_patch14_reg4_dinov2.lvd142m` / `vit_so400m_patch14_siglip_224.webli`)
+    and only the projector came from openvla-7b. OpenVLA fine-tunes its vision encoder,
+    so those are different weights (relative L2 0.20-0.46 per tensor) and every earlier
+    vision PCC was measured against the wrong towers. Now all three come from the
+    checkpoint's `vision_backbone.featurizer.*`, `vision_backbone.fused_featurizer.*`
+    and `projector.*` tensors (see tt/openvla_weights.py), timm is not imported, and
+    nothing is downloaded from timm's hub repos."""
+    from tt import openvla_weights
 
     dcfg = Dinov2Config(num_register_tokens=4, no_embed_class=True, pretrained_image_size=224)
     scfg = SiglipConfig()
     pcfg = ProjectorConfig()
 
-    dinov2_ref = timm.create_model(
-        "vit_large_patch14_reg4_dinov2.lvd142m", pretrained=True, num_classes=0, img_size=dcfg.image_size
-    )
-    dinov2_sd = timm_vit_reg_state_dict_to_hf_style(
-        {k: v.float() for k, v in dinov2_ref.state_dict().items()}, num_layers=dcfg.num_layers
-    )
-
-    siglip_ref = timm.create_model(
-        "vit_so400m_patch14_siglip_224.webli", pretrained=True, num_classes=0, img_size=scfg.image_size
-    )
-    raw = {k: v.float() for k, v in siglip_ref.state_dict().items()}
-    siglip_sd = {
-        "embeddings.patch_embedding.weight": raw["patch_embed.proj.weight"],
-        "embeddings.patch_embedding.bias": raw["patch_embed.proj.bias"],
-        "embeddings.position_embedding.weight": raw["pos_embed"][0],
-        "post_layernorm.weight": raw["norm.weight"],
-        "post_layernorm.bias": raw["norm.bias"],
-    }
-    for i in range(scfg.num_layers):
-        src, dst = f"blocks.{i}", f"encoder.layers.{i}"
-        qkv_w, qkv_b = raw[f"{src}.attn.qkv.weight"], raw[f"{src}.attn.qkv.bias"]
-        hidden = qkv_w.shape[1]
-        q_w, k_w, v_w = qkv_w.split(hidden, dim=0)
-        q_b, k_b, v_b = qkv_b.split(hidden, dim=0)
-        siglip_sd[f"{dst}.self_attn.q_proj.weight"] = q_w
-        siglip_sd[f"{dst}.self_attn.k_proj.weight"] = k_w
-        siglip_sd[f"{dst}.self_attn.v_proj.weight"] = v_w
-        siglip_sd[f"{dst}.self_attn.q_proj.bias"] = q_b
-        siglip_sd[f"{dst}.self_attn.k_proj.bias"] = k_b
-        siglip_sd[f"{dst}.self_attn.v_proj.bias"] = v_b
-        siglip_sd[f"{dst}.self_attn.out_proj.weight"] = raw[f"{src}.attn.proj.weight"]
-        siglip_sd[f"{dst}.self_attn.out_proj.bias"] = raw[f"{src}.attn.proj.bias"]
-        siglip_sd[f"{dst}.layer_norm1.weight"] = raw[f"{src}.norm1.weight"]
-        siglip_sd[f"{dst}.layer_norm1.bias"] = raw[f"{src}.norm1.bias"]
-        siglip_sd[f"{dst}.layer_norm2.weight"] = raw[f"{src}.norm2.weight"]
-        siglip_sd[f"{dst}.layer_norm2.bias"] = raw[f"{src}.norm2.bias"]
-        siglip_sd[f"{dst}.mlp.fc1.weight"] = raw[f"{src}.mlp.fc1.weight"]
-        siglip_sd[f"{dst}.mlp.fc1.bias"] = raw[f"{src}.mlp.fc1.bias"]
-        siglip_sd[f"{dst}.mlp.fc2.weight"] = raw[f"{src}.mlp.fc2.weight"]
-        siglip_sd[f"{dst}.mlp.fc2.bias"] = raw[f"{src}.mlp.fc2.bias"]
-
-    shard_path = glob.glob(
-        os.path.join(openvla_hf_cache_glob_dir(), "model-00001-of-00003.safetensors")
-    )[0]
-    proj_sd = {}
-    with safe_open(shard_path, framework="pt") as f:
-        for k in f.keys():
-            if k.startswith("projector."):
-                proj_sd[k[len("projector."):]] = f.get_tensor(k).float()
-
+    # Both come back in timm's own flat key naming (blocks.N.attn.qkv, ls1.gamma, ...),
+    # which the two converters below already understand -- the same converters the
+    # generic-timm path used, so only the SOURCE of the tensors changed.
+    dinov2_raw, siglip_raw = openvla_weights.load_tower_state_dicts_timm_naming()
+    dinov2_sd = timm_vit_reg_state_dict_to_hf_style(dinov2_raw, num_layers=dcfg.num_layers)
+    siglip_sd = openvla_weights.timm_siglip_state_dict_to_hf_style(siglip_raw, num_layers=scfg.num_layers)
+    proj_sd = openvla_weights.load_projector_state_dict()
     return dcfg, dinov2_sd, scfg, siglip_sd, pcfg, proj_sd
 
 
@@ -277,11 +241,7 @@ def main():
 
         print(f"generated action token ids: {generated}")
 
-        import json
-        from huggingface_hub import hf_hub_download
-
-        config_path = hf_hub_download("openvla/openvla-7b", "config.json")
-        openvla_config = json.load(open(config_path))
+        openvla_config = load_config()  # same pinned snapshot as the weights
         norm_stats = openvla_config["norm_stats"][UNNORM_KEY]["action"]
         vocab_size = openvla_config["text_config"]["vocab_size"] - openvla_config["pad_to_multiple_of"]
 

@@ -1,0 +1,16 @@
+# Separate venv for tt/hf_reference.py -- upstream openvla-7b's modeling_prismatic.py
+# refuses to run with timm >= 1.0 (it checks timm.__version__ against 0.9.10-0.9.16), so it
+# cannot share a venv with the serving stack (timm 1.0.29). Validated 2026-09-27:
+#   uv venv --python 3.12 hfref
+#   uv pip install --python hfref/bin/python --extra-index-url https://download.pytorch.org/whl/cpu -r tt/hf_reference.requirements.txt
+torch==2.3.1+cpu
+timm==0.9.16
+transformers==4.40.1
+tokenizers==0.19.1
+accelerate<1.0
+numpy<2
+huggingface_hub<0.26
+pillow
+safetensors
+sentencepiece
+protobuf

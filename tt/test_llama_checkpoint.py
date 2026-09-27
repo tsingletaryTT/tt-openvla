@@ -47,7 +47,7 @@ def _hf_state_dict_from_meta(sd: dict) -> dict:
 def main():
     from transformers import LlamaConfig, LlamaForCausalLM
 
-    from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict
+    from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict, reinit_rope_buffers
 
     cfg_dict = get_llama2_config()
     config = LlamaConfig(
@@ -72,6 +72,9 @@ def main():
     with torch.device("meta"):
         model = LlamaForCausalLM(config)
     model = model.to_empty(device="cpu")
+    # to_empty() leaves RoPE inv_freq uninitialized (non-persistent buffer); see
+    # llama_checkpoint.reinit_rope_buffers -- without this the reference has no RoPE.
+    reinit_rope_buffers(model)
 
     print("Loading real openvla/openvla-7b LLM weights via llama_checkpoint.py...")
     sd = load_openvla_llama_state_dict()

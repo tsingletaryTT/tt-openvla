@@ -26,7 +26,7 @@ demo/Generator machinery this port is deliberately not depending on."""
 
 from __future__ import annotations
 
-import glob
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -98,31 +98,33 @@ def hf_to_meta_key(hf_key: str) -> Optional[str]:
     return None
 
 
-def openvla_hf_cache_glob_dir() -> str:
-    """The glob dir for openvla-7b's local HF cache snapshot, respecting $HF_HOME the
-    way huggingface_hub itself does (defaults to ~/.cache/huggingface if unset).
-    Hardcoding ~/.cache/huggingface directly breaks whenever HF_HOME points elsewhere
-    -- e.g. tt-model-manager's own container sets HF_HOME=/hf, which os.path.expanduser
-    ignores entirely, so a hardcoded path resolves to the wrong (empty) directory
-    inside that container and silently finds zero shards."""
-    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-    return os.path.join(hf_home, "hub", "models--openvla--openvla-7b", "snapshots", "*")
+def load_openvla_llama_state_dict(snapshot: Optional[str] = None) -> dict:
+    """Loads all `language_model.*` weights from the real openvla/openvla-7b checkpoint
+    and renames them to tt_transformers' expected keys. Returns float32 tensors
+    (matching this repo's convention elsewhere of upcasting for host-side correctness
+    comparisons; TTNN-side loaders cast to bf16/bfp8 themselves).
 
+    Where the shards come from is `tt.openvla_weights.snapshot_dir()`: it DOWNLOADS them
+    (pinned revision, honouring HF_HOME / HF_MODEL / TT_MODEL_WEIGHTS_REVISION) when they
+    are not already cached. Before tt-openvla-serving 0.2.0 this function only globbed
+    `$HF_HOME/hub/models--openvla--openvla-7b/snapshots/*/`, so a fresh install with an
+    empty HF_HOME failed at startup with "expected 3 safetensors shards, found []".
+    Shard names come from the checkpoint's own model.safetensors.index.json, not a glob.
 
-def load_openvla_llama_state_dict(hf_cache_dir: Optional[str] = None) -> dict:
-    """Loads all `language_model.*` weights from the real openvla/openvla-7b
-    checkpoint's 3 safetensors shards and renames them to tt_transformers' expected
-    keys. Returns float32 tensors (matching this repo's convention elsewhere of
-    upcasting for host-side correctness comparisons; TTNN-side loaders cast to
-    bf16/bfp8 themselves)."""
-    if hf_cache_dir is None:
-        hf_cache_dir = openvla_hf_cache_glob_dir()
-    shard_paths = sorted(glob.glob(os.path.join(hf_cache_dir, "model-0000*-of-00003.safetensors")))
-    assert len(shard_paths) == 3, f"expected 3 safetensors shards, found {shard_paths}"
+    `snapshot`: optional explicit checkpoint directory (tests); defaults to the resolved
+    snapshot."""
+    from tt import openvla_weights
+
+    if snapshot is None:
+        shard_paths = openvla_weights.shard_paths()
+    else:
+        with open(os.path.join(snapshot, "model.safetensors.index.json")) as f:
+            names = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(snapshot, n) for n in names]
 
     state_dict = {}
     for path in shard_paths:
-        with safe_open(path, framework="pt") as f:
+        with safe_open(str(path), framework="pt") as f:
             for hf_key in f.keys():
                 if not hf_key.startswith("language_model."):
                     continue
@@ -133,3 +135,43 @@ def load_openvla_llama_state_dict(hf_cache_dir: Optional[str] = None) -> dict:
     expected_count = 32 * len(_HF_TO_META_PER_LAYER) + len(_HF_TO_META_TOP_LEVEL)
     assert len(state_dict) == expected_count, f"expected {expected_count} renamed keys, got {len(state_dict)}"
     return state_dict
+
+
+def reinit_rope_buffers(model: torch.nn.Module) -> torch.nn.Module:
+    """Recompute RoPE's `inv_freq` after `to_empty()` -- REQUIRED for every CPU reference
+    built with the `with torch.device("meta"): ...; model.to_empty(device="cpu")` pattern.
+
+    Why this exists (found 2026-09-27, while comparing against the real HF model):
+    `inv_freq` is a NON-persistent buffer, so it is not in any state dict and
+    `load_state_dict` never touches it. `to_empty()` allocates it uninitialized; on this box
+    it came back as ~0 (e.g. [6.1e-19, 0, 0, ...]), which silently turns rotary position
+    embedding into the identity -- a LLaMA with no positional information. Every CPU
+    reference in this repo before tt-openvla-serving 0.2.0 was built that way, so every
+    "LLaMA vs transformers" number and the recorded reference action tokens were measured
+    against a RoPE-less model. (Uninitialized memory also explains the old, intermittent
+    "eager attention gives NaN" note: garbage inv_freq, not an eager-attention bug.)
+
+    Handles both layouts transformers has used: a model-level `rotary_emb` (4.4x+) and
+    per-attention-layer `rotary_emb` modules (older). Returns the model for chaining, and
+    asserts the result matches the textbook formula so a future transformers refactor that
+    moves the buffer fails loudly here instead of silently again."""
+    fixed = 0
+    for mod in model.modules():
+        if not hasattr(mod, "inv_freq"):
+            continue
+        cfg = getattr(mod, "config", None)
+        if cfg is not None and hasattr(mod, "rope_init_fn"):
+            inv_freq, scaling = mod.rope_init_fn(cfg, torch.device("cpu"))
+            mod.attention_scaling = scaling
+        else:  # older layout: dim/base on the module itself
+            dim, base = mod.dim, mod.base
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+        mod.inv_freq = inv_freq
+        if hasattr(mod, "original_inv_freq"):
+            mod.original_inv_freq = inv_freq
+        dim = inv_freq.numel() * 2
+        expected = 1.0 / (10000.0 ** (torch.arange(0, dim, 2).float() / dim))
+        assert torch.allclose(mod.inv_freq.float(), expected, rtol=1e-5), "RoPE inv_freq re-init mismatch"
+        fixed += 1
+    assert fixed > 0, "no rotary embedding module with an inv_freq buffer found -- transformers layout changed?"
+    return model
