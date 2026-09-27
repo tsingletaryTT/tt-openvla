@@ -46,7 +46,8 @@ json_numpy.patch()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import build_app  # noqa: E402
-from backends import DEFAULT_UNNORM_KEY, TTNNBackend  # noqa: E402
+from backends import DEFAULT_UNNORM_KEY, TTNNBackend, build_openvla_prompt  # noqa: E402
+from tt import openvla_weights  # noqa: E402  (backends put the repo root on sys.path)
 
 # The only unnorm_key this demo actually defaults to (see app.py's build_app) -- used
 # as-is if the real list can't be fetched at import time (no writable HF cache, or no
@@ -55,13 +56,14 @@ _FALLBACK_UNNORM_KEYS = ["bridge_orig"]
 
 
 def _resolve_unnorm_keys() -> list[str]:
-    try:
-        from huggingface_hub import hf_hub_download
-
-        config_path = hf_hub_download("openvla/openvla-7b", "config.json")
-        return sorted(json.load(open(config_path))["norm_stats"].keys())
-    except Exception:
+    """unnorm_key choices for the dropdown, from config.json at the PINNED revision
+    (tt/openvla_weights.py). Only config.json is fetched here -- never the shards -- and
+    any failure (no network, read-only cache at build-time verify) degrades to the
+    static fallback instead of failing the import."""
+    config = openvla_weights.try_load_config_without_download()
+    if config is None:
         return _FALLBACK_UNNORM_KEYS
+    return sorted(config["norm_stats"].keys())
 
 
 class _BackendHandle:
@@ -122,22 +124,57 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 
 
+def _parse_act_payload(payload: dict) -> tuple[dict, bool]:
+    """Accept both request shapes upstream `vla-scripts/deploy.py` accepts.
+
+    - Plain: {"image": <uint8 HxWx3 array>, "instruction": str, "unnorm_key": str?},
+      numpy-aware via json_numpy (patched at import time above).
+    - Double-encoded: {"encoded": "<json_numpy string of the plain payload>"}, for
+      clients where json_numpy can't patch the HTTP layer. Upstream requires it to be the
+      ONLY key; so do we.
+    Returns (payload, was_encoded)."""
+    if "encoded" in payload:
+        if len(payload) != 1:
+            raise ValueError("an 'encoded' payload must be the only key (same rule as upstream deploy.py)")
+        return json.loads(payload["encoded"]), True
+    return payload, False
+
+
 @app.post("/act")
 async def act(request: Request) -> JSONResponse:
-    """Mirrors openvla/openvla's own reference server (`vla-scripts/deploy.py`)
-    exactly, so existing OpenVLA client code / robot-control loops written against
-    that server work against this bundle unmodified: POST a JSON body
-    {"image": <uint8 HxWx3 array>, "instruction": "<string>", "unnorm_key": "<string,
-    optional>"} (numpy-aware JSON via json_numpy.patch(), applied at import time
-    above) and get back {"action": <float array>}. Reuses the exact backend instance
-    the Gradio UI calls (same loaded weights, same mesh) -- no separate model load."""
-    payload = await request.json()
-    image = Image.fromarray(np.asarray(payload["image"], dtype=np.uint8)).convert("RGB")
-    instruction = payload["instruction"]
-    unnorm_key = payload.get("unnorm_key", DEFAULT_UNNORM_KEY)
-    full_prompt = f"In: What action should the robot take to {instruction.strip().rstrip('?')}?\nOut:"
-    result = await asyncio.to_thread(_backend.predict_action, image, full_prompt, unnorm_key=unnorm_key)
-    return JSONResponse(content={"action": result["action"]})
+    """OpenVLA's REST contract, modelled on upstream `vla-scripts/deploy.py`. NOT a
+    byte-for-byte clone -- the differences below are deliberate and documented rather
+    than hidden (0.1.1's docstring claimed exact parity; it wasn't).
+
+    Request -- same as upstream: plain or {"encoded": ...} payload (see
+    `_parse_act_payload`), same prompt template including `instruction.lower()` (`backends.build_openvla_prompt`), same
+    greedy decoding, same token-29871 fix-up (in the backend).
+
+    Response -- DIFFERS from upstream:
+      * Always `{"action": [7 floats]}` (a JSON object with a plain list). Upstream returns
+        the BARE array (json_numpy-encoded ndarray; for `encoded` requests, a json_numpy
+        string). An unmodified upstream client that does `action = r.json()` and indexes it
+        as an array must read `r.json()["action"]` here instead.
+      * `unnorm_key` defaults to "bridge_orig". Upstream defaults to None, which for
+        openvla-7b (trained on many datasets) fails its own assertion and returns "error".
+      * Errors are HTTP 4xx/5xx with a JSON `detail`; upstream returns HTTP 200 with the
+        string "error".
+
+    Concurrency: the backend serializes predictions with a lock (see
+    `TTNNBackend.predict_action`), so concurrent requests queue and are answered one at a
+    time instead of racing on the single mesh (0.1.1 hung on a 4-way burst). Reuses the
+    exact backend instance the Gradio UI calls (same weights, same mesh, same lock)."""
+    try:
+        payload, _was_encoded = _parse_act_payload(await request.json())
+        image = Image.fromarray(np.asarray(payload["image"], dtype=np.uint8)).convert("RGB")
+        instruction = payload["instruction"]
+        unnorm_key = payload.get("unnorm_key") or DEFAULT_UNNORM_KEY
+    except (KeyError, ValueError, TypeError) as e:
+        return JSONResponse(status_code=400, content={"detail": f"bad /act payload: {e!r}"})
+    result = await asyncio.to_thread(
+        _backend.predict_action, image, build_openvla_prompt(instruction), unnorm_key=unnorm_key
+    )
+    return JSONResponse(content={"action": [float(x) for x in result["action"]]})
 
 
 # path="/" (not "") makes Starlette's Mount 307-redirect "/" -> "//" -- reproduced in

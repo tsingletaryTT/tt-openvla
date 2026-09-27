@@ -24,7 +24,7 @@ from models.tt_transformers.tt.common import Mode  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tt.functional_llama import build_model, build_model_args, prefill_rot_mats  # noqa: E402
-from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict  # noqa: E402
+from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict, reinit_rope_buffers  # noqa: E402
 
 
 def pcc(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -47,6 +47,9 @@ def reference_hidden_state_after_layer0(sd: dict, cfg: dict, input_ids: torch.Te
     with torch.device("meta"):
         model = LlamaModel(config)
     model = model.to_empty(device="cpu")
+    # to_empty() leaves RoPE inv_freq uninitialized (non-persistent buffer); see
+    # llama_checkpoint.reinit_rope_buffers -- without this the reference has no RoPE.
+    reinit_rope_buffers(model)
 
     hf_sd = {"embed_tokens.weight": sd["tok_embeddings.weight"], "norm.weight": sd["norm.weight"]}
     meta_to_hf_layer = {

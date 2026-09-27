@@ -30,7 +30,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 EXAMPLE_IMAGE_PATH = REPO_ROOT / "gradio_app" / "assets" / "example.jpg"
-EXAMPLE_PROMPT = "What action should the robot take to open the drawer?"
+# Just the instruction: build_openvla_prompt wraps it in OpenVLA's template. (0.1.1's
+# default was the whole question, which the template then wrapped a second time.)
+EXAMPLE_PROMPT = "open the drawer"
 
 ACTION_LABELS = ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"]
 
@@ -65,7 +67,7 @@ to demonstrate a semantically correct drawer-opening prediction."""
                 image_in = gr.Image(label="Image", type="pil", value=_load_example_image())
                 prompt_in = gr.Textbox(
                     label="Instruction", value=EXAMPLE_PROMPT,
-                    placeholder="What action should the robot take to ...?",
+                    placeholder="e.g. open the drawer  (sent as: What action should the robot take to <this>?)",
                 )
                 unnorm_key_in = gr.Dropdown(
                     label="Unnormalization stats (dataset)", choices=unnorm_keys,
@@ -85,7 +87,9 @@ to demonstrate a semantically correct drawer-opening prediction."""
                 raise gr.Error("Upload or select an image first.")
             if not prompt.strip():
                 raise gr.Error("Enter an instruction.")
-            full_prompt = f"In: What action should the robot take to {prompt.strip().rstrip('?')}?\nOut:"
+            from backends import build_openvla_prompt
+
+            full_prompt = build_openvla_prompt(prompt.strip())
             result = backend.predict_action(image, full_prompt, unnorm_key=unnorm_key)
             # gr.BarPlot.postprocess only converts a DataFrame into renderable chart data --
             # a plain dict is passed straight through unprocessed (its `isinstance(value, dict)`

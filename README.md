@@ -21,26 +21,34 @@ bring-ups in the world-model/robotics-manipulation space), not code-sharing.
 
 ## Status
 
-Core pipeline validated end to end, component by component, each against real
-checkpoint weights at >=0.995 PCC: DINOv2 (register variant) -> SigLIP -> fused
-VisionBackbone -> Projector -> full 32-layer LLaMA-2-7B backbone -> action
-detokenization. See `tt/` for the individual modules and their correctness tests.
+**0.2.0 (2026-09-27): correctness against the real upstream model.** Earlier versions were
+validated only against this repo's own composed PyTorch reference, and that reference shared
+bugs with the TTNN path, so the old PCC figures (0.996-0.999) did not measure agreement with
+OpenVLA. 0.2.0 fixes them and measures against upstream's own
+`AutoModelForVision2Seq.from_pretrained("openvla/openvla-7b", trust_remote_code=True,
+revision=47a0ec7f...)` on CPU (`tt/hf_reference.py`). Fixed:
 
-A real "Grounded Check" demo (`tt/demo_grounded_check.py`) runs a real image and
-OpenVLA's own documented prompt through the whole pipeline end to end: vision -> fused
-embeddings -> one PREFILL pass + 6 real `Mode.DECODE` steps through all 32 real
-LLaMA-2-7B layers, on a real 2-device mesh -- producing an actual, deterministic
-decoded 7-DoF action from real weights. Getting decode working took two real fixes:
-custom embeddings needed the same tensor-parallel width-sharding
-(`ttnn.ShardTensor2dMesh`) the framework's own `Embedding` module uses internally, and
-a genuine non-determinism bug in this port's own decode-loop code (reading the wrong
-row of a batch-padded output tile -- caught by rerunning the same fixed-input,
-greedy-decoded pipeline and getting different, sometimes vocabulary-range-violating
-results each time, then reverified deterministic after the fix). See that file's
-module docstring for the full detail, including a separate, reproducible `transformers`
-library bug hit and root-caused along the way (non-deterministic NaN logits from its
-default "eager" attention implementation at this real sequence length -- fixed by
-requesting `sdpa`).
+- the vision towers were timm's *generic* pretrained DINOv2/SigLIP, not openvla-7b's
+  fine-tuned towers (now loaded from the checkpoint's `vision_backbone.*` tensors);
+- the TTNN LLaMA applied Meta-style RoPE to HF-layout wq/wk (wrong dimension pairs);
+- the CPU reference had no RoPE at all (`to_empty()` left `inv_freq` uninitialized);
+- the prompt lacked token 29871, which upstream `predict_action` appends;
+- a fresh install could not find the weights; `/act` had no lock and hung on concurrent calls.
+
+Measured on one p300c (2 chips), four image/instruction pairs, against upstream fp32:
+
+| stage | result |
+|---|---|
+| DINOv2 / SigLIP towers, projector (TTNN, served mesh path) | PCC 0.9998 / 0.9997 / 0.9996-0.9998 |
+| prefill logits (last position) | PCC 0.994-0.995 |
+| 7 greedy action tokens, exact match | 5/7, 7/7, 1/7, 7/7 |
+| max \|action diff\| (bridge_orig) | 0.011, 0.0, 0.045, 0.0 |
+
+Token divergences happen at steps where upstream's own top-1/top-2 logit margin is small
+(the 1/7 case: 0.68 at step 0; upstream's own bf16 CPU run also flips a token on that input).
+Per-layer PCC decays smoothly from 0.9999 to about 0.998 across the 32 layers: accumulated
+bf16 error, not a structural mismatch. Treat actions as close to, but **not bit-identical
+with**, upstream OpenVLA. No task-success evaluation (BridgeData V2 / LIBERO) has been run.
 
 ## Interactive demo
 
@@ -53,8 +61,9 @@ click). Two backends, same interface (`gradio_app/backends.py`, mirroring
 `gradio_app/backends.py` pattern):
 
 ```bash
-# Real Blackhole hardware (default) -- hold a gozer lease covering 2 chips first
-TT_METAL_HOME=/path/to/tt-metal .venv/bin/python3 gradio_app/app.py
+# Real Blackhole hardware (default) -- under a gozer lease covering 2 chips
+gozer run --chips 2 --who "you:openvla" --reason "demo" -- \
+    env TT_METAL_HOME=/path/to/tt-metal .venv/bin/python3 gradio_app/app.py
 
 # CPU-only reference (what an HF Space without Tenstorrent hardware runs)
 .venv/bin/python3 gradio_app/app.py --backend reference
@@ -71,6 +80,18 @@ opening a plain single device alongside an open 2-device mesh in the same proces
 [tt-discolike](https://github.com/tsingletaryTT/tt-discolike) (`chips: 2`, matching the
 LLaMA backbone's real tensor-parallel mesh requirement) for one-click start/stop
 alongside this machine's other TT gradio demos (tt-vjepa2, tt-animatediff).
+
+## REST: `POST /act`
+
+The served bundle (`gradio_app.asgi:app`) also exposes `/act`, modelled on upstream
+`openvla/openvla`'s `vla-scripts/deploy.py`. **Requests** match upstream: a json_numpy body
+`{"image": uint8 HxWx3, "instruction": str, "unnorm_key": str?}` or the double-encoded
+`{"encoded": "<json_numpy string>"}`; the prompt is upstream's template with
+`instruction.lower()`. **Responses differ** from upstream, deliberately and documented:
+always `{"action": [7 floats]}` (upstream returns the bare array), `unnorm_key` defaults to
+`bridge_orig` (upstream's `None` fails for openvla-7b), and errors are HTTP 4xx/5xx
+(upstream returns 200 with `"error"`). An upstream client needs `r.json()["action"]`.
+Concurrent requests queue behind one lock and are answered one at a time.
 
 ## Benchmarks
 
@@ -124,15 +145,13 @@ things (this repo's code vs. Meta's weights) and it would be easy to conflate th
 
 ## Architecture (confirmed so far)
 
-- **Vision**: DINOv2 ViT-L/14, register-token variant (`vit_large_patch14_reg4_dinov2
-  .lvd142m` via timm -- NOT the plain `facebook/dinov2-large` this repo validated
-  first; corrected after reading OpenVLA's own `configuration_prismatic.py`, which
-  names the real timm checkpoint id) + SigLIP ViT-So400M/14 (`vit_so400m_patch14
-  _siglip_224.webli` via timm, bit-identical to `google/siglip-so400m-patch14-224` --
-  checked directly after finding the *bare*, untagged timm name now silently resolves
-  to a SigLIP2 checkpoint that didn't exist when OpenVLA was released). Both run at
-  224px (not DINOv2's own 518px default -- position embeddings need interpolating,
-  handled host-side).
+- **Vision**: DINOv2 ViT-L/14, register-token variant (architecture of timm's
+  `vit_large_patch14_reg4_dinov2.lvd142m`) + SigLIP ViT-So400M/14 (architecture of
+  `vit_so400m_patch14_siglip_224`), both at 224px. **Weights: openvla-7b's own fine-tuned
+  `vision_backbone.featurizer.*` / `vision_backbone.fused_featurizer.*` tensors**, not timm's
+  generic pretrained checkpoints (versions before 0.2.0 used the generic ones by mistake;
+  the two differ by 0.2-0.46 relative L2 per tensor). timm is used only for the CPU
+  reference's architecture (`pretrained=False`) and nothing is downloaded from timm's repos.
   **Fusion mechanism, confirmed from `modeling_prismatic.py`'s
   `PrismaticVisionBackbone`**: the 224x224x3 input image is preprocessed twice (once
   per tower's own normalization) and stacked into a 6-channel tensor; each tower runs
@@ -141,13 +160,14 @@ things (this repo's code vs. Meta's weights) and it would be easy to conflate th
   tokens are dropped, leaving only the 256 per-patch tokens); the two towers' patch
   tokens are concatenated along the feature dim (1024+1152=2176), then projected
   through a 3-layer GELU MLP (2176 -> 4x -> llm_dim -> llm_dim) into LLaMA's embedding
-  space. All of the above is ported and validated (PCC 0.996-0.999) against real
-  weights, including the Projector's own weights, which only exist in the
-  `openvla/openvla-7b` checkpoint itself (a downstream fine-tuned artifact, not
-  derivable from either frozen vision tower's own pretrained weights).
+  space. All of the above is ported and validated against upstream's own modules on
+  openvla-7b's weights (towers PCC 0.9998/0.9997, projector 0.9997; see Status). Note the
+  towers are fine-tuned too, not frozen: only the checkpoint has the right weights.
 - **Backbone**: LLaMA-2-7B (Llama Community License), all 32 layers, real fine-tuned
-  `openvla-7b` weights, validated end to end (PCC 0.9966 on final logits against a real
-  `transformers.LlamaForCausalLM`). Built by reusing tt-metal's own
+  `openvla-7b` weights, validated against upstream's own model (prefill logits PCC
+  0.994-0.995; the older "0.9966" figure was against a RoPE-less reference and is void).
+  wq/wk are converted to Meta RoPE layout (`reverse_permute`) before tt_transformers sees
+  them. Built by reusing tt-metal's own
   `models/tt_transformers` `Transformer`/`ModelArgs` directly (its attention/RoPE/
   KV-cache kernels and tuned program configs, not hand-ported) rather than the
   separate, unfinished `models/experimental/openvla` attempt already in tt-metal

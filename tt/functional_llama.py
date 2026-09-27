@@ -28,6 +28,8 @@ comparison is always False) -- avoided here by always passing the actual enum.""
 
 from __future__ import annotations
 
+import os
+
 import ttnn
 from models.tt_transformers.tt.common import Mode
 from models.tt_transformers.tt.model import Transformer
@@ -48,7 +50,38 @@ class OpenVLALlamaArgs(ModelArgs):
         return super()._set_params_from_dict(new_config)
 
     def load_state_dict(self):
-        return load_openvla_llama_state_dict()
+        """openvla-7b's LLaMA weights, with wq/wk converted from HF to Meta RoPE layout.
+
+        tt_transformers (with its default use_hf_rope=False) applies RoPE the Meta way:
+        rotating INTERLEAVED pairs (x0,x1),(x2,x3),... of each head. HF's LLaMA checkpoints
+        store wq/wk pre-permuted for HF's rotate_half, which pairs x_i with x_{i+64}. The
+        base class's own HF loader fixes this with `convert_hf_qkv_to_meta_format`
+        (reverse_permute on every q_proj/k_proj); this override bypasses that loader, and
+        before tt-openvla-serving 0.2.0 it bypassed the permutation too -- RoPE rotated the
+        wrong pairs, and the TTNN LLM disagreed with the real openvla-7b (prefill logits
+        PCC 0.55-0.70, 0-1/7 action tokens). It went unnoticed because the CPU reference it
+        was compared against had NO working RoPE at all (see
+        llama_checkpoint.reinit_rope_buffers). Same reverse_permute tt_transformers uses."""
+        from models.tt_transformers.tt.load_checkpoints import reverse_permute
+
+        sd = load_openvla_llama_state_dict()
+        for k in list(sd):
+            if k.endswith(".attention.wq.weight") or k.endswith(".attention.wk.weight"):
+                t = sd[k]
+                sd[k] = reverse_permute(t, t.shape[0] // self.head_dim, t.shape[0], t.shape[1])
+        return sd
+
+    def weight_cache_path(self, dtype):
+        """Versioned tensor-cache dir. tt_transformers caches converted weights by NAME
+        only (e.g. `layers.0.attention.wqkv_sharded_2d...tensorbin`), so a cache written by
+        0.1.1 -- un-permuted wq/wk, and possibly another checkpoint revision -- would be
+        reloaded silently after this fix. Keying the dir on the revision + the q/k layout
+        makes a stale cache miss instead of load."""
+        from tt.openvla_weights import model_id, weights_revision
+
+        tag = "local" if os.path.isdir(model_id()) else weights_revision()[:12]
+        base = super().weight_cache_path(dtype)
+        return base.parent / f"openvla-7b-{tag}-qk-meta" / base.name
 
 
 def build_model_args(mesh_device, *, max_seq_len: int = 512, max_batch_size: int = 1, n_layers: int | None = None):

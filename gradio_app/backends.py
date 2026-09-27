@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,11 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tt.action_detokenizer import detokenize_actions  # noqa: E402
-from tt.llama_checkpoint import (  # noqa: E402
-    get_llama2_config,
-    load_openvla_llama_state_dict,
-    openvla_hf_cache_glob_dir,
-)
+from tt.llama_checkpoint import get_llama2_config, load_openvla_llama_state_dict, reinit_rope_buffers  # noqa: E402
+from tt import openvla_weights  # noqa: E402
 
 ACTION_DIM = 7
 DEFAULT_UNNORM_KEY = "bridge_orig"
@@ -47,36 +45,83 @@ _META_TO_HF_LAYER = {
 
 
 def _get_processor():
-    from transformers import AutoProcessor
-
-    return AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
+    """openvla-7b's own processor. Its code is REMOTE (trust_remote_code=True), so it is
+    loaded at the same pinned revision as the weights -- see tt/openvla_weights.py."""
+    return openvla_weights.load_processor()
 
 
 def _get_norm_stats_and_vocab():
-    import json
-
-    from huggingface_hub import hf_hub_download
-
-    config_path = hf_hub_download("openvla/openvla-7b", "config.json")
-    openvla_config = json.load(open(config_path))
+    """norm_stats (for unnormalizing actions) + the un-padded vocab size, from the same
+    pinned snapshot's config.json (earlier versions fetched config.json unpinned)."""
+    openvla_config = openvla_weights.load_config()
     vocab_size = openvla_config["text_config"]["vocab_size"] - openvla_config["pad_to_multiple_of"]
     return openvla_config["norm_stats"], vocab_size
 
 
+def build_openvla_prompt(instruction: str) -> str:
+    """Upstream deploy.py's `get_openvla_prompt` for openvla-7b (non-v01), verbatim:
+    `instruction.lower()` inside the fixed template. Used by BOTH the /act route and the
+    Gradio UI. 0.1.1 had two variants: /act skipped `.lower()` and stripped a trailing
+    '?', and the Gradio UI wrapped its textbox -- whose default value was already the full
+    "What action should the robot take to open the drawer?" question -- in the template
+    again, so the UI's default prompt said "...take to What action should the robot take
+    to open the drawer?"."""
+    return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+
+
+def _tokenize(processor, image, prompt: str):
+    """processor(prompt, image) + upstream predict_action's own input fix-up: append token
+    29871 after the final ':' (openvla-7b was trained with it; its processor does not
+    emit it). Both backends share this so they feed the LLM the sequence upstream does."""
+    inputs = processor(prompt, image)
+    return inputs["pixel_values"], openvla_weights.append_empty_token(inputs["input_ids"])
+
+
+def build_reference_towers():
+    """(dinov2, siglip) as timm modules on CPU, eval mode, carrying openvla-7b's own
+    fine-tuned tower weights.
+
+    timm supplies only the ARCHITECTURE (`pretrained=False`, so nothing is fetched from
+    timm's hub repos); `load_state_dict(strict=True)` then installs the checkpoint's
+    `vision_backbone.featurizer.*` / `vision_backbone.fused_featurizer.*` tensors, which
+    are a verified exact key match. The model ids/image size are the ones openvla-7b's
+    own config.json names. The SigLIP id is the BARE `vit_so400m_patch14_siglip_224`
+    config.json uses: with pretrained=False a tag would only select pretrained weights,
+    and the architecture is the same either way.
+
+    Build these AFTER the LLaMA model (see ReferenceBackend.__init__'s load-order note)."""
+    import timm
+
+    dinov2_sd, siglip_sd = openvla_weights.load_tower_state_dicts_timm_naming()
+    towers = []
+    for model_name, sd in ((openvla_weights.DINOV2_TIMM_ID, dinov2_sd), (openvla_weights.SIGLIP_TIMM_ID, siglip_sd)):
+        m = timm.create_model(model_name, pretrained=False, num_classes=0, img_size=openvla_weights.IMAGE_SIZE)
+        m.load_state_dict(sd, strict=True)
+        towers.append(m.eval())
+    return towers[0], towers[1]
+
+
 class ReferenceBackend:
-    """Pure PyTorch, CPU. Real timm vision towers + real transformers.LlamaForCausalLM,
-    built from the exact same openvla-7b weights this repo's TTNN port uses -- see
-    tt/test_demo_grounded_check.py's reference_generate() for the one-shot version this
-    is adapted from. attn_implementation="sdpa" is load-bearing, not cosmetic: the
+    """Pure PyTorch, CPU. timm vision towers (architecture only, `pretrained=False`) and
+    transformers.LlamaForCausalLM, ALL loaded with openvla-7b's own fine-tuned weights --
+    the exact tensors the TTNN port uses (tt/openvla_weights.py). Before 0.2.0 the towers
+    here were timm's generic pretrained weights, the same substitution the TTNN path
+    made, so the two agreed with each other and both disagreed with OpenVLA.
+
+    This is a composed re-implementation, not upstream's modeling_prismatic.py (which
+    needs timm 0.9.x and can't be imported next to this stack's timm 1.x). The ground
+    truth for correctness claims is the real HF model; see tt/test_demo_grounded_check.py.
+
+    attn_implementation="sdpa" is load-bearing, not cosmetic: the
     default "eager" implementation produced non-deterministic NaN logits at this real
     sequence length in this environment -- see that module's docstring."""
 
     name = "reference-pytorch"
 
     def __init__(self):
-        from safetensors import safe_open
         from transformers import LlamaConfig, LlamaForCausalLM
 
+        self._lock = threading.Lock()
         self.processor = _get_processor()
         self.norm_stats, self.vocab_size = _get_norm_stats_and_vocab()
         self.cfg = get_llama2_config()
@@ -107,6 +152,9 @@ class ReferenceBackend:
         with torch.device("meta"):
             self.model = LlamaForCausalLM(config)
         self.model = self.model.to_empty(device="cpu")
+        # to_empty() leaves RoPE inv_freq uninitialized (non-persistent buffer); see
+        # llama_checkpoint.reinit_rope_buffers -- without this the reference has no RoPE.
+        reinit_rope_buffers(self.model)
         hf_sd = {
             "model.embed_tokens.weight": sd["tok_embeddings.weight"], "model.norm.weight": sd["norm.weight"],
             "lm_head.weight": sd["output.weight"],
@@ -121,32 +169,18 @@ class ReferenceBackend:
         self.model.eval()
         self.tok_embed_w = sd["tok_embeddings.weight"]
 
-        print("[reference] loading DINOv2 + SigLIP + Projector...")
-        import timm
-
-        self.dinov2 = timm.create_model(
-            "vit_large_patch14_reg4_dinov2.lvd142m", pretrained=True, num_classes=0, img_size=224
-        ).eval()
-        self.siglip = timm.create_model(
-            "vit_so400m_patch14_siglip_224.webli", pretrained=True, num_classes=0, img_size=224
-        ).eval()
-
-        import glob
-
-        shard_path = glob.glob(
-            os.path.join(openvla_hf_cache_glob_dir(), "model-00001-of-00003.safetensors")
-        )[0]
-        self.proj_sd = {}
-        with safe_open(shard_path, framework="pt") as f:
-            for k in f.keys():
-                if k.startswith("projector."):
-                    self.proj_sd[k[len("projector."):]] = f.get_tensor(k).float()
+        print("[reference] loading DINOv2 + SigLIP + Projector (openvla-7b's own weights)...")
+        self.dinov2, self.siglip = build_reference_towers()
+        self.proj_sd = openvla_weights.load_projector_state_dict()
         print("[reference] ready")
 
     def predict_action(self, image, prompt: str, unnorm_key: str = DEFAULT_UNNORM_KEY) -> dict:
+        with self._lock:  # see TTNNBackend.predict_action; cheap insurance here too
+            return self._predict_action_locked(image, prompt, unnorm_key)
+
+    def _predict_action_locked(self, image, prompt: str, unnorm_key: str) -> dict:
         t0 = time.perf_counter()
-        inputs = self.processor(prompt, image)
-        pixel_values, input_ids = inputs["pixel_values"], inputs["input_ids"]
+        pixel_values, input_ids = _tokenize(self.processor, image, prompt)
 
         img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
         with torch.no_grad():
@@ -180,10 +214,10 @@ class ReferenceBackend:
 
 class TTNNBackend:
     """This repo's own TTNN port, real Blackhole hardware. Caller must already hold a
-    gozer lease covering 4 chips and have TT_VISIBLE_DEVICES set -- this class does not
-    acquire one.
+    gozer lease covering 2 chips (one p300c board) and have TT_VISIBLE_DEVICES set --
+    this class does not acquire one. (Earlier docs here said 4; the mesh is 1x2.)
 
-    Needs 4 chips, not 2: the LLaMA-2-7B backbone needs a real 2-device
+    Needs 2 chips, not 1: the LLaMA-2-7B backbone needs a real 2-device
     tensor-parallel mesh (see tt/demo_grounded_check.py's mesh-device comment for why
     a single chip overflows L1 in decode mode). Vision runs on the SAME mesh, not a
     separate single-device context -- confirmed directly: opening a plain single
@@ -225,6 +259,7 @@ class TTNNBackend:
         from tt.functional_siglip import Model as SiglipModel
         from tt.functional_vision_backbone import VisionBackbone
 
+        self._lock = threading.Lock()  # serializes predict_action; see its docstring
         self.ttnn = ttnn
         self.Mode = Mode
         self.build_fused_embeddings = build_fused_embeddings
@@ -309,11 +344,27 @@ class TTNNBackend:
         return self.ttnn.to_torch(single_shard).reshape(1, 256, self.pcfg.llm_dim).float()
 
     def predict_action(self, image, prompt: str, unnorm_key: str = DEFAULT_UNNORM_KEY) -> dict:
+        """Serialized: one prediction on the mesh at a time, whoever the caller is.
+
+        The model has ONE mesh, ONE set of on-device KV caches and ONE rope/decode state.
+        Two overlapping calls interleave prefill/decode ops on that shared state; in
+        tt-openvla-serving 0.1.1 a 4-way concurrent /act burst left 4 threads inside this
+        method at once and the server hung (no error, 200% CPU, SIGTERM ignored, board
+        reset needed). The lock lives HERE, not in one route, because there are two
+        entry points into this method -- Gradio's click handler (which runs in Gradio's
+        own worker thread; its concurrency_limit=1 only covers Gradio's queue) and the
+        /act route (asyncio.to_thread in the ASGI app) -- and both must queue behind
+        the same lock. A threading.Lock (not asyncio.Lock) because both callers reach
+        this method from worker threads, not from the event loop. Latency reported in
+        the result covers only the work done after the lock is acquired."""
+        with self._lock:
+            return self._predict_action_locked(image, prompt, unnorm_key)
+
+    def _predict_action_locked(self, image, prompt: str, unnorm_key: str) -> dict:
         ttnn, Mode = self.ttnn, self.Mode
         t0 = time.perf_counter()
 
-        inputs = self.processor(prompt, image)
-        pixel_values, input_ids = inputs["pixel_values"], inputs["input_ids"]
+        pixel_values, input_ids = _tokenize(self.processor, image, prompt)
 
         vision_embeds = self._run_vision(pixel_values)
         fused_embeds = self.build_fused_embeddings(input_ids, vision_embeds, self.llama_sd["tok_embeddings.weight"])
