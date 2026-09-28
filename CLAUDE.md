@@ -20,6 +20,12 @@ starts with the 0.2.0 correctness fix.
   serving wheel), a checkout whose `tt/` lacks `__init__.py` is SHADOWED by the wheel. Tests
   print the file under test for this reason.
 
+## 2026-09-27: tt-openvla-serving 0.2.1 (version bump only)
+Taylor asked for the bump after a repackage smoke test ran OLD code: the review fixes landed on
+the branch after 0.2.0 was built, and uv reused its cached 0.2.0 wheel, so `instruction: 123`
+returned 500 instead of 400 until the cache was bypassed. Same version = same wheel to uv, so every
+served-code change gets a new version. No code change in this bump.
+
 ## 2026-09-27: tt-openvla-serving 0.2.0 (branch `fix/openvla-weights-and-towers`)
 
 **Prompt (orchestrator):** fix three confirmed bugs from the HF-bundle review/bench: (1) the

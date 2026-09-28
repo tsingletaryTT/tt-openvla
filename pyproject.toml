@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tt-openvla-serving"
-version = "0.2.0"
+version = "0.2.1"
 description = "OpenVLA-7B (vision-language-action) on Tenstorrent Blackhole via TTNN. The published tt-openvla-serving wheel is built by scripts/build-serving-wheel.sh, which stages only the served-path closure (gradio_app + the tt/ modules backends.py reaches, incl. openvla_weights.py) and asserts nothing else is in it. A plain `uv build` here packages the full gradio_app/ and tt/ trees (bring-up scripts and tests included) for local dev only; do not publish that."
 requires-python = ">=3.10"
 

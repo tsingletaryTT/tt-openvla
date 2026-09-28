@@ -21,6 +21,11 @@ bring-ups in the world-model/robotics-manipulation space), not code-sharing.
 
 ## Status
 
+**0.2.1 (2026-09-27):** the review fixes merged after 0.2.0 was first built: a non-string
+`/act` instruction returns 400 instead of 500, and a local checkpoint directory gets its own
+converted-weight cache. The version bump keeps a cached 0.2.0 wheel from being reused over
+the new code, which is what happened the first time these fixes were tested.
+
 **0.2.0 (2026-09-27): correctness against the real upstream model.** Earlier versions were
 validated only against this repo's own composed PyTorch reference, and that reference shared
 bugs with the TTNN path, so the old PCC figures (0.996-0.999) did not measure agreement with
