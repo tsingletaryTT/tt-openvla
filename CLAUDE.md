@@ -5,20 +5,71 @@ via tt_transformers), served as a v6 thin bundle (`episod/tt-openvla`, kind `tt-
 app `gradio_app.asgi:app`) on one p300c board (2 chips, 1x2 mesh).
 
 Earlier history (bring-up, Gradio, packaging) lives in the git log and README. This file
-starts with the 0.2.0 correctness fix.
+starts with the 0.2.0 correctness fix and the 0.3.0 repackaging.
 
 ## Working notes
 
 * Every device-touching command goes through gozer (`gozer run --chips 2 --who ...`).
   `import ttnn` opens the runtime: no bare imports outside a lease.
-* Build the published wheel with `scripts/build-serving-wheel.sh`, never plain `uv build`
-  (that one includes tests and bring-up scripts).
+* Stage the published bundle with `scripts/package-thin.sh` (stage only, never pushes; see the
+  2026-10-16 entry). The served-path file list is `scripts/thin/served_files.txt`.
 * Correctness ground truth is the REAL upstream model (`tt/hf_reference.py`, own venv from
   `tt/hf_reference.requirements.txt`, because upstream needs timm 0.9.x). Never validate
   against this repo's own composed reference alone: it once shared bugs with the TTNN path.
 * A test under `tt/` imports `tt.*`. If a `tt` regular package is installed in the venv (the
-  serving wheel), a checkout whose `tt/` lacks `__init__.py` is SHADOWED by the wheel. Tests
-  print the file under test for this reason.
+  0.2.x serving wheel), a checkout whose `tt/` lacks `__init__.py` is SHADOWED by the wheel.
+  Tests print the file under test for this reason. The 0.3.0 bundle ships no such wheel.
+
+## 2026-10-16: tt-openvla 0.3.0, repackaged to the canonical v6 thin shape (branch `feat/v6-canonical-shape`)
+
+**Prompt (orchestrator):** repackage the published v6 bundle to the shape in tt-model-manager
+PR #183 (docs/E2E_RECIPE_V6.md, skill `tt-model-thin-package`): stock ttnn, model code in
+`--extra-code`, `--constraints`, no whole-`models/` wheel. Stage only; no push, no hardware.
+
+**Starting point.** `episod/tt-openvla` 0.2.1 was already v6 thin (`tt-dit-server`), not a v5.1
+container. The recipe was not in git: it was a one-off `tt-model package-thin` run. The old shape
+had two `--models-wheel`s (`tt-openvla-serving` plus a 158-file `models/` closure that carried
+gpt_oss and deepseek demos), no constraints, and a requirements file that put everything through
+the PyTorch CPU index. A 0.1.1 install of that shape (cached on this box) held `certifi 2022.12.7`,
+`requests 2.28.1`, `urllib3 1.26.13` and `idna 3.4`, which is the index-ranking downgrade the
+docs describe.
+
+**What changed.** The recipe is now `scripts/package-thin.sh` plus `scripts/thin/`.
+* `extra_code/` holds the served files (`served_files.txt`, 16 files) and 28 tt-metal v0.77.0
+  files (27 `.py` and one YAML), found by walking the imports with the AST (`closure.py`).
+  The first derivation had 27 files. A smoke import with a stub `ttnn` showed the closure also
+  needs `prefetcher/prefetcher_config.yaml`, which `prefetcher.py` opens at import time, so
+  `closure.py` now follows data files named by relative string literals.
+* `requirements.txt` is `ttnn==0.77.0` + torch/torchvision CPU pins. Everything else is declared by
+  `tt-openvla-runtime-deps`, a wheel with no code, installed by path through `--ops-wheel` (a step
+  without the PyTorch index). `constraints.txt` pins all 82 packages; `REFRESH_CONSTRAINTS=1`
+  regenerates it with a two-stage resolve.
+* Five `--verify` guards (ttnn version, no second `models` location, extra_code present, no stale
+  CA/requests stack, validated pins). None imports ttnn.
+* `scripts/build-serving-wheel.sh` is gone; `pyproject.toml` (0.3.0) is a dev package only.
+* `scripts/thin/card.md` is the HF model card (copied from the published 0.2.1 card, text updated
+  for the new shape). The script stages it with `--readme`.
+
+**Decisions.**
+* No tt-transformers tooling wheel. tt-transformers 2.x requires `ttnn==0.79.0` and has TTTv2
+  modules. This model builds on the TTTv1 `Transformer`/`ModelArgs` in tt-metal v0.77.0, so the
+  needed files ship as model code instead of as a tooling dependency. Porting to TTTv2 is a
+  separate piece of work and needs hardware.
+* No `--ops-wheel` of kernels (there are none) and no `--tool-parser`/`--reasoning-parser` (no chat
+  API). `--mesh-fabric` stays unset because `backends.py` sets fabric itself.
+* `requirements.txt` lists fastapi/uvicorn/pydantic/pillow behind a marker that is never true.
+  `tt-model` appends those four names to the requirements of a tt-dit-server bundle unless they are
+  listed, and resolving them in step 1 pulls idna from the PyTorch index, which fails under
+  constraints. The marker is a workaround for `tt-model`; remove it when that is fixed upstream.
+* The tt-metal files come from the published 0.2.1 closure wheel (sha256 pinned in the script),
+  because no v0.77.0 checkout is available on this box.
+
+**Verified (no hardware):** the 30 staged-bundle checks in `inspect_stage.py`; `install.sh` in a
+copy (exit 0, `uv pip check` clean, all five guards pass, `certifi 2026.7.22`, `requests 2.34.2`);
+a smoke import of all 42 extra_code modules (and `model`) under a stub `ttnn`, all resolving from
+`extra_code/`; `tt/test_package_recipe.py` (27 tests; five mutations each turned a test red).
+**Not verified:** serving on hardware, `/act` output, the accuracy and latency numbers in the card
+(they were measured on 0.2.1), `tt-model pull`/`serve` of the staged bundle, the push.
 
 ## 2026-09-27: tt-openvla-serving 0.2.1 (version bump only)
 Taylor asked for the bump after a repackage smoke test ran OLD code: the review fixes landed on

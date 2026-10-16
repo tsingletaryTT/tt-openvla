@@ -1,0 +1,8 @@
+# Inputs to the constraints.txt resolve (scripts/package-thin.sh, REFRESH_CONSTRAINTS=1).
+# These versions are the ones the 0.2.1 bundle was verified with on hardware.
+torch==2.14.0+cpu
+torchvision==0.29.0+cpu
+numpy==1.26.4
+pillow==11.3.0
+pandas<3
+huggingface-hub==0.36.2

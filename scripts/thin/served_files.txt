@@ -1,0 +1,21 @@
+# The files that make up the served path: gradio_app/asgi.py and everything it reaches.
+# The thin bundle ships them under extra_code/ (one path per line, repo-relative).
+# scripts/package-thin.sh copies exactly these and scripts/thin/closure.py derives the
+# tt-metal closure from them. If backends.py or asgi.py start importing a new tt/ module,
+# add it here; tt/test_package_recipe.py fails until you do.
+gradio_app/__init__.py
+gradio_app/app.py
+gradio_app/asgi.py
+gradio_app/backends.py
+gradio_app/assets/example.jpg
+tt/__init__.py
+tt/action_detokenizer.py
+tt/demo_grounded_check.py
+tt/functional_encoder.py
+tt/functional_llama.py
+tt/functional_projector.py
+tt/functional_siglip.py
+tt/functional_vision_backbone.py
+tt/llama_checkpoint.py
+tt/openvla_weights.py
+tt/tt_metal_patches.py

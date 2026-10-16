@@ -1,0 +1,19 @@
+# Step 1 of install.sh: the engine, resolved with the PyTorch CPU index added by tt-model.
+# Keep this file to ttnn + torch. That index carries one old copy of idna, certifi, requests
+# and urllib3, and uv takes any package the index carries only from it. Everything wider
+# (transformers, gradio, fastapi, ...) is declared by the tt-openvla-runtime-deps wheel,
+# which install.sh installs by path in a later step without that index.
+# No index options belong in this file (--extra-index-url, --index-url, --find-links).
+ttnn==0.77.0
+torch==2.14.0+cpu
+torchvision==0.29.0+cpu
+
+# tt-model appends the tt-dit-server base HTTP stack to requirements.txt unless each name is
+# already listed. Resolving fastapi here would pull idna through anyio from the PyTorch index,
+# and --constraints would then fail the install. These four lines carry a marker that is
+# never true, so tt-model sees the names and uv skips them. The runtime-deps wheel installs
+# them in the later step.
+fastapi; python_version < "0"
+uvicorn; python_version < "0"
+pydantic>=2; python_version < "0"
+pillow; python_version < "0"
