@@ -1,0 +1,30 @@
+# tt-metal v0.77.0 files the served code can reach (scripts/thin/closure.py derive). One path per line.
+# Regenerate with: python3 -I scripts/thin/closure.py derive <unpacked closure wheel> scripts/thin/served_files.txt
+models/common/lightweightmodule.py
+models/common/modules/tt_ccl.py
+models/common/rmsnorm.py
+models/common/sampling/__init__.py
+models/common/sampling/_utils.py
+models/common/sampling/generator.py
+models/common/sampling/tt_log_probs.py
+models/common/sampling/tt_penalties.py
+models/common/sampling/tt_sampling.py
+models/common/sampling/vocab_padding.py
+models/common/tensor_utils.py
+models/common/utility_functions.py
+models/tt_transformers/tt/attention.py
+models/tt_transformers/tt/ccl.py
+models/tt_transformers/tt/common.py
+models/tt_transformers/tt/decoder.py
+models/tt_transformers/tt/distributed_norm.py
+models/tt_transformers/tt/embedding.py
+models/tt_transformers/tt/lm_head.py
+models/tt_transformers/tt/load_checkpoints.py
+models/tt_transformers/tt/mixtral_mlp.py
+models/tt_transformers/tt/mixtral_moe.py
+models/tt_transformers/tt/mlp.py
+models/tt_transformers/tt/model.py
+models/tt_transformers/tt/model_config.py
+models/tt_transformers/tt/prefetcher.py
+models/tt_transformers/tt/prefetcher/prefetcher_config.yaml
+models/tt_transformers/tt/rope.py

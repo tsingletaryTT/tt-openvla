@@ -21,6 +21,10 @@ bring-ups in the world-model/robotics-manipulation space), not code-sharing.
 
 ## Status
 
+**0.3.0 (2026-10-16):** packaging only. The published bundle moves to the canonical v6 thin shape
+(`scripts/package-thin.sh`; details in CLAUDE.md). The served code is unchanged, and the bundle has not been
+re-verified on hardware yet.
+
 **0.2.1 (2026-09-27):** the review fixes merged after 0.2.0 was first built: a non-string
 `/act` instruction returns 400 instead of 500, and a local checkpoint directory gets its own
 converted-weight cache. The version bump keeps a cached 0.2.0 wheel from being reused over
@@ -129,10 +133,11 @@ Two publishing surfaces beyond GitHub + the HF model card above:
   episod/tt-openvla`) -- the earlier `tt-model.yaml` v5.1 CONTAINER attempt is gone
   (that whole schema is no longer the project's target; its build was blocked on this
   machine's shared TT_METAL_HOME checkout having uninitialized git submodules, never
-  resolved). `pyproject.toml` builds `tt-openvla-serving`, the served-path closure
-  (`gradio_app`'s ASGI app + the `tt/` functional_* modules it reaches); a second wheel
-  vendors the `models/common` + `models/tt_transformers/tt` closure already
-  hardware-verified the same day for episod/tt-tnt (identical tt-metal v0.77.0 source).
+  resolved). `scripts/package-thin.sh` stages the bundle (0.3.0, canonical shape): the served-path
+  files (`scripts/thin/served_files.txt`) and the 28 tt-metal v0.77.0 files they reach ship under
+  `extra_code/`, stock `ttnn==0.77.0` comes from PyPI, and one code-free wheel declares the other
+  Python packages. Every install step runs under `constraints.txt`. The script stages only; it
+  never pushes.
   This was the first non-diffusion model on the `tt-dit-server` kind (so far only
   exercised by FLUX.2-dev/tt-animatediff/tt-skyreels) -- hardware-verified end to end:
   mesh open on a real 2-chip P300, weights fetched, and a real prediction through the
